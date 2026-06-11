@@ -1,8 +1,9 @@
 from textwrap import wrap
 
-from django.shortcuts import get_object_or_404
 from django.conf import settings
+from django.db import IntegrityError
 from django.http import HttpResponse
+from django.shortcuts import get_object_or_404
 from rest_framework import generics, permissions, status
 from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.parsers import FormParser, MultiPartParser
@@ -189,13 +190,18 @@ class ConsentSignatureView(APIView):
             raise ValidationError("You have already signed this agreement.")
         serializer = ConsentSignatureSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        signature = serializer.save(
-            agreement=agreement,
-            signer=request.user,
-            ip_address=client_ip(request),
-            user_agent=request.META.get("HTTP_USER_AGENT", ""),
-            verification_status="VERIFIED" if request.user.is_identity_verified else "PENDING",
-        )
+        try:
+            signature = serializer.save(
+                agreement=agreement,
+                signer=request.user,
+                ip_address=client_ip(request),
+                user_agent=request.META.get("HTTP_USER_AGENT", ""),
+                verification_status="VERIFIED" if request.user.is_identity_verified else "PENDING",
+            )
+        except IntegrityError as exc:
+            if "unique_signature_per_agreement_signer" in str(exc):
+                raise ValidationError("You have already signed this agreement.") from exc
+            raise
         activated = agreement.activate_if_ready()
         write_audit(
             request,

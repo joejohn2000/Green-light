@@ -1203,11 +1203,13 @@ class _AgreementDetailScreenState extends State<AgreementDetailScreen> {
   }
 
   Future<void> sign() async {
+    final signatureText = signature.text.trim();
+    if (signatureText.isEmpty) {
+      toast('Enter your signature name.');
+      return;
+    }
     try {
-      await sl<ConsentRepository>().sign(
-        widget.agreementId,
-        signature.text.trim(),
-      );
+      await sl<ConsentRepository>().sign(widget.agreementId, signatureText);
       signature.clear();
       reload();
     } catch (error) {
