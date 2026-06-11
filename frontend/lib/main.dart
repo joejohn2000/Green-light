@@ -434,7 +434,11 @@ class ConsentRepository {
     return Agreement.fromJson(data);
   }
 
-  Future<Agreement> renew(int id, int durationHours, {DateTime? requestedExpiresAt}) async {
+  Future<Agreement> renew(
+    int id,
+    int durationHours, {
+    DateTime? requestedExpiresAt,
+  }) async {
     return Agreement.fromJson(
       await _api.post('/consents/agreements/$id/renew/', {
         'duration_hours': durationHours,
@@ -505,6 +509,7 @@ class Agreement {
     required this.durationHours,
     this.creatorName,
     this.participantName,
+    this.requestedExpiresAt,
     this.expiresAt,
     required this.signatures,
   });
@@ -516,6 +521,7 @@ class Agreement {
   final int durationHours;
   final String? creatorName;
   final String? participantName;
+  final DateTime? requestedExpiresAt;
   final DateTime? expiresAt;
   final List<Map<String, dynamic>> signatures;
 
@@ -528,6 +534,9 @@ class Agreement {
       durationHours: json['duration_hours'] ?? 24,
       creatorName: json['creator_name'],
       participantName: json['participant_name'],
+      requestedExpiresAt: json['requested_expires_at'] == null
+          ? null
+          : DateTime.parse(json['requested_expires_at']),
       expiresAt: json['expires_at'] == null
           ? null
           : DateTime.parse(json['expires_at']),
@@ -979,7 +988,44 @@ class _NewAgreementScreenState extends State<NewAgreementScreen> {
   final title = TextEditingController(text: 'Mutual Consent Agreement');
   final terms = TextEditingController();
   int durationHours = 24;
+  int selectedPresetHours = 24;
+  DateTime requestedExpiresAt = DateTime.now().add(const Duration(hours: 24));
   bool loading = false;
+
+  void setPreset(int hours) {
+    setState(() {
+      durationHours = hours;
+      selectedPresetHours = hours;
+      requestedExpiresAt = DateTime.now().add(Duration(hours: hours));
+    });
+  }
+
+  Future<void> pickExpirationDate() async {
+    final now = DateTime.now();
+    final date = await showDatePicker(
+      context: context,
+      initialDate: requestedExpiresAt,
+      firstDate: now,
+      lastDate: now.add(const Duration(days: 365)),
+    );
+    if (date == null || !mounted) return;
+    final time = await showTimePicker(
+      context: context,
+      initialTime: TimeOfDay.fromDateTime(requestedExpiresAt),
+    );
+    if (time == null) return;
+    setState(() {
+      requestedExpiresAt = DateTime(
+        date.year,
+        date.month,
+        date.day,
+        time.hour,
+        time.minute,
+      );
+      durationHours = requestedExpiresAt.difference(now).inHours.clamp(1, 8760);
+      selectedPresetHours = 0;
+    });
+  }
 
   Future<void> submit() async {
     setState(() => loading = true);
@@ -989,6 +1035,7 @@ class _NewAgreementScreenState extends State<NewAgreementScreen> {
         title: title.text.trim(),
         terms: terms.text.trim(),
         durationHours: durationHours,
+        requestedExpiresAt: requestedExpiresAt,
       );
       if (mounted) context.go('/agreements/${agreement.id}');
     } catch (error) {
@@ -1041,10 +1088,31 @@ class _NewAgreementScreenState extends State<NewAgreementScreen> {
                 label: Text('30d'),
                 icon: Icon(Icons.event_available_rounded),
               ),
+              ButtonSegment(
+                value: 0,
+                label: Text('Custom'),
+                icon: Icon(Icons.edit_calendar_rounded),
+              ),
             ],
-            selected: {durationHours},
-            onSelectionChanged: (value) =>
-                setState(() => durationHours = value.first),
+            selected: {selectedPresetHours},
+            onSelectionChanged: (value) {
+              if (value.first == 0) {
+                pickExpirationDate();
+              } else {
+                setPreset(value.first);
+              }
+            },
+          ),
+          const SizedBox(height: 12),
+          ListTile(
+            contentPadding: const EdgeInsets.symmetric(horizontal: 12),
+            leading: const Icon(Icons.event_available_rounded),
+            title: const Text('Expiration date'),
+            subtitle: Text(
+              DateFormat.yMMMd().add_jm().format(requestedExpiresAt),
+            ),
+            trailing: const Icon(Icons.edit_calendar_rounded),
+            onTap: pickExpirationDate,
           ),
           const SizedBox(height: 18),
           FilledButton.icon(
@@ -1056,6 +1124,28 @@ class _NewAgreementScreenState extends State<NewAgreementScreen> {
       ),
     );
   }
+}
+
+Future<DateTime?> pickAgreementExpirationDate(
+  BuildContext context,
+  DateTime initial,
+) async {
+  final now = DateTime.now();
+  final date = await showDatePicker(
+    context: context,
+    initialDate: initial.isBefore(now)
+        ? now.add(const Duration(hours: 1))
+        : initial,
+    firstDate: now,
+    lastDate: now.add(const Duration(days: 365)),
+  );
+  if (date == null || !context.mounted) return null;
+  final time = await showTimePicker(
+    context: context,
+    initialTime: TimeOfDay.fromDateTime(initial),
+  );
+  if (time == null) return null;
+  return DateTime(date.year, date.month, date.day, time.hour, time.minute);
 }
 
 class AgreementDetailScreen extends StatefulWidget {
@@ -1095,11 +1185,17 @@ class _AgreementDetailScreenState extends State<AgreementDetailScreen> {
     }
   }
 
-  Future<void> renew(int hours) async {
+  Future<void> renew() async {
     try {
+      final nextExpiration = await pickAgreementExpirationDate(
+        context,
+        DateTime.now().add(Duration(hours: 24)),
+      );
+      if (nextExpiration == null) return;
       final renewed = await sl<ConsentRepository>().renew(
         widget.agreementId,
-        hours,
+        nextExpiration.difference(DateTime.now()).inHours.clamp(1, 8760),
+        requestedExpiresAt: nextExpiration,
       );
       if (mounted) context.go('/agreements/${renewed.id}');
     } catch (error) {
@@ -1111,6 +1207,14 @@ class _AgreementDetailScreenState extends State<AgreementDetailScreen> {
     try {
       await sl<ConsentRepository>().revoke(widget.agreementId);
       reload();
+    } catch (error) {
+      toast(error.toString());
+    }
+  }
+
+  Future<void> downloadPdf() async {
+    try {
+      await sl<ConsentRepository>().downloadAgreementPdf(widget.agreementId);
     } catch (error) {
       toast(error.toString());
     }
@@ -1134,77 +1238,62 @@ class _AgreementDetailScreenState extends State<AgreementDetailScreen> {
             );
           }
           final agreement = snapshot.data!;
+          final canSign = agreement.status == 'PENDING_SIGNATURES';
+          final canRevoke =
+              agreement.status == 'ACTIVE' ||
+              agreement.status == 'PENDING_SIGNATURES';
+          final canRenew =
+              agreement.status == 'EXPIRED' || agreement.status == 'REVOKED';
           return ListView(
             padding: const EdgeInsets.all(20),
             children: [
-              SectionCard(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
-                      children: [
-                        Expanded(
-                          child: Text(
-                            agreement.title,
-                            style: Theme.of(context).textTheme.headlineSmall,
-                          ),
-                        ),
-                        StatusPill(status: agreement.status),
-                      ],
-                    ),
-                    const SizedBox(height: 10),
-                    Text(
-                      '${agreement.creatorName ?? 'Creator'} and ${agreement.participantName ?? 'Participant'}',
-                    ),
-                    if (agreement.expiresAt != null) ...[
-                      const SizedBox(height: 6),
+              LegalAgreementDocument(agreement: agreement),
+              const SizedBox(height: 14),
+              if (canSign) ...[
+                SectionCard(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
                       Text(
-                        'Expires ${DateFormat.yMMMd().add_jm().format(agreement.expiresAt!.toLocal())}',
+                        'Sign Agreement',
+                        style: Theme.of(context).textTheme.titleLarge,
+                      ),
+                      const SizedBox(height: 8),
+                      for (final item in agreement.signatures)
+                        ListTile(
+                          contentPadding: EdgeInsets.zero,
+                          leading: const Icon(Icons.draw_rounded),
+                          title: Text(_signatureTitle(item)),
+                          subtitle: Text(item['signed_at'] ?? ''),
+                        ),
+                      TextField(
+                        controller: signature,
+                        decoration: const InputDecoration(
+                          labelText: 'Signature name',
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      FilledButton.icon(
+                        onPressed: sign,
+                        icon: const Icon(Icons.edit_document),
+                        label: const Text('Sign agreement'),
                       ),
                     ],
-                    const Divider(height: 28),
-                    Text(agreement.terms),
-                  ],
+                  ),
                 ),
+                const SizedBox(height: 14),
+              ],
+              FilledButton.icon(
+                onPressed: downloadPdf,
+                icon: const Icon(Icons.download_rounded),
+                label: const Text('Download PDF'),
               ),
-              const SizedBox(height: 14),
-              SectionCard(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      'Signatures',
-                      style: Theme.of(context).textTheme.titleLarge,
-                    ),
-                    const SizedBox(height: 8),
-                    for (final item in agreement.signatures)
-                      ListTile(
-                        contentPadding: EdgeInsets.zero,
-                        leading: const Icon(Icons.draw_rounded),
-                        title: Text(_signatureTitle(item)),
-                        subtitle: Text(item['signed_at'] ?? ''),
-                      ),
-                    TextField(
-                      controller: signature,
-                      decoration: const InputDecoration(
-                        labelText: 'Signature name',
-                      ),
-                    ),
-                    const SizedBox(height: 12),
-                    FilledButton.icon(
-                      onPressed: sign,
-                      icon: const Icon(Icons.edit_document),
-                      label: const Text('Sign agreement'),
-                    ),
-                  ],
-                ),
-              ),
-              const SizedBox(height: 14),
+              const SizedBox(height: 10),
               Row(
                 children: [
                   Expanded(
                     child: OutlinedButton.icon(
-                      onPressed: revoke,
+                      onPressed: canRevoke ? revoke : null,
                       icon: const Icon(Icons.block_rounded),
                       label: const Text('Revoke'),
                     ),
@@ -1212,7 +1301,7 @@ class _AgreementDetailScreenState extends State<AgreementDetailScreen> {
                   const SizedBox(width: 10),
                   Expanded(
                     child: FilledButton.icon(
-                      onPressed: () => renew(agreement.durationHours),
+                      onPressed: canRenew ? renew : null,
                       icon: const Icon(Icons.autorenew_rounded),
                       label: const Text('Renew'),
                     ),
@@ -1226,6 +1315,212 @@ class _AgreementDetailScreenState extends State<AgreementDetailScreen> {
         },
       ),
     );
+  }
+}
+
+class LegalAgreementDocument extends StatelessWidget {
+  const LegalAgreementDocument({required this.agreement, super.key});
+
+  final Agreement agreement;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final expiry = agreement.expiresAt ?? agreement.requestedExpiresAt;
+    return Container(
+      decoration: BoxDecoration(
+        color: Theme.of(context).cardTheme.color,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: scheme.outlineVariant),
+      ),
+      padding: const EdgeInsets.all(22),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Center(
+            child: Column(
+              children: [
+                Text(
+                  'GREEN LIGHT',
+                  style: Theme.of(context).textTheme.labelLarge?.copyWith(
+                    letterSpacing: 0,
+                    color: scheme.primary,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  'MUTUAL CONSENT AGREEMENT',
+                  textAlign: TextAlign.center,
+                  style: Theme.of(context).textTheme.headlineSmall?.copyWith(
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                StatusPill(status: agreement.status),
+              ],
+            ),
+          ),
+          const Divider(height: 34),
+          ContractMetaGrid(
+            rows: [
+              ('Agreement ID', 'GL-${agreement.id.toString().padLeft(6, '0')}'),
+              ('Created', 'Recorded in secure audit history'),
+              (
+                'Expires',
+                expiry == null
+                    ? 'Pending activation'
+                    : DateFormat.yMMMMd().add_jm().format(expiry.toLocal()),
+              ),
+              ('Validity', agreement.status.replaceAll('_', ' ')),
+            ],
+          ),
+          const SizedBox(height: 20),
+          ContractSection(
+            title: 'Participants',
+            child: Column(
+              children: [
+                ContractLine(
+                  label: 'Party A',
+                  value: agreement.creatorName?.isNotEmpty == true
+                      ? agreement.creatorName!
+                      : 'Verified creator',
+                ),
+                ContractLine(
+                  label: 'Party B',
+                  value: agreement.participantName?.isNotEmpty == true
+                      ? agreement.participantName!
+                      : 'Verified participant',
+                ),
+                const ContractLine(
+                  label: 'Verification',
+                  value:
+                      'Identity, device, and location confirmations are recorded in the audit trail.',
+                ),
+              ],
+            ),
+          ),
+          ContractSection(
+            title: 'Agreement Terms',
+            child: Text(
+              agreement.terms,
+              style: Theme.of(
+                context,
+              ).textTheme.bodyLarge?.copyWith(height: 1.45),
+            ),
+          ),
+          ContractSection(
+            title: 'Digital Signatures',
+            child: agreement.signatures.isEmpty
+                ? const Text('Signatures are pending.')
+                : Column(
+                    children: [
+                      for (final item in agreement.signatures)
+                        ContractLine(
+                          label: _signatureTitle(item),
+                          value:
+                              'Signed ${formatApiDate(item['signed_at'])}; Location ${item['location_confirmed'] == true ? 'confirmed' : 'not confirmed'}',
+                        ),
+                    ],
+                  ),
+          ),
+          Text(
+            'This document is generated by Green Light and reflects the recorded consent status at the time of viewing.',
+            style: Theme.of(
+              context,
+            ).textTheme.bodySmall?.copyWith(color: scheme.onSurfaceVariant),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class ContractSection extends StatelessWidget {
+  const ContractSection({required this.title, required this.child, super.key});
+
+  final String title;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 20),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            title.toUpperCase(),
+            style: Theme.of(context).textTheme.labelLarge?.copyWith(
+              fontWeight: FontWeight.w800,
+              color: Theme.of(context).colorScheme.secondary,
+            ),
+          ),
+          const SizedBox(height: 10),
+          child,
+        ],
+      ),
+    );
+  }
+}
+
+class ContractMetaGrid extends StatelessWidget {
+  const ContractMetaGrid({required this.rows, super.key});
+
+  final List<(String, String)> rows;
+
+  @override
+  Widget build(BuildContext context) {
+    return Wrap(
+      spacing: 10,
+      runSpacing: 10,
+      children: [
+        for (final row in rows)
+          SizedBox(
+            width: 240,
+            child: ContractLine(label: row.$1, value: row.$2),
+          ),
+      ],
+    );
+  }
+}
+
+class ContractLine extends StatelessWidget {
+  const ContractLine({required this.label, required this.value, super.key});
+
+  final String label;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 112,
+            child: Text(
+              label,
+              style: TextStyle(
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ),
+          Expanded(child: Text(value)),
+        ],
+      ),
+    );
+  }
+}
+
+String formatApiDate(dynamic value) {
+  if (value == null || value.toString().isEmpty) return 'time unavailable';
+  try {
+    return DateFormat.yMMMd().add_jm().format(DateTime.parse(value).toLocal());
+  } catch (_) {
+    return value.toString();
   }
 }
 

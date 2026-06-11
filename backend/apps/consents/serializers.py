@@ -172,16 +172,23 @@ class ConsentRenewSerializer(serializers.Serializer):
 
     def create(self, validated_data):
         agreement = self.context["agreement"]
-        request = self.context["request"]
-        return ConsentAgreement.objects.create(
-            creator=request.user,
-            participant=agreement.participant if agreement.creator == request.user else agreement.creator,
-            title=agreement.title,
-            terms=agreement.terms,
-            duration_hours=validated_data.get("duration_hours") or agreement.duration_hours,
-            requested_expires_at=validated_data.get("requested_expires_at"),
-            previous_agreement=agreement,
+        agreement.duration_hours = validated_data.get("duration_hours") or agreement.duration_hours
+        agreement.requested_expires_at = validated_data.get("requested_expires_at")
+        agreement.status = ConsentAgreement.Status.PENDING_SIGNATURES
+        agreement.starts_at = None
+        agreement.expires_at = None
+        agreement.save(
+            update_fields=[
+                "duration_hours",
+                "requested_expires_at",
+                "status",
+                "starts_at",
+                "expires_at",
+                "updated_at",
+            ]
         )
+        agreement.signatures.all().delete()
+        return agreement
 
 
 class AuditLogSerializer(serializers.ModelSerializer):

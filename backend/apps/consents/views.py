@@ -179,7 +179,7 @@ class ConsentSignatureView(APIView):
     def post(self, request, pk):
         agreement = get_object_or_404(agreement_queryset_for(request.user), pk=pk)
         agreement.mark_expired_if_needed()
-        if agreement.status not in [ConsentAgreement.Status.PENDING_SIGNATURES, ConsentAgreement.Status.ACTIVE]:
+        if agreement.status != ConsentAgreement.Status.PENDING_SIGNATURES:
             raise ValidationError("This agreement cannot be signed in its current state.")
         if not request.user.is_identity_verified:
             raise PermissionDenied("Identity verification is required before signing.")
@@ -211,9 +211,14 @@ class ConsentRenewView(APIView):
         agreement = get_object_or_404(agreement_queryset_for(request.user), pk=pk)
         serializer = ConsentRenewSerializer(data=request.data, context={"request": request, "agreement": agreement})
         serializer.is_valid(raise_exception=True)
-        renewed = serializer.save()
-        write_audit(request, "agreement_renewed", renewed, {"previous_agreement_id": agreement.id})
-        return Response(ConsentAgreementSerializer(renewed, context={"request": request}).data, status=status.HTTP_201_CREATED)
+        renewed_agreement = serializer.save()
+        write_audit(
+            request,
+            "agreement_renewed",
+            renewed_agreement,
+            {"requires_new_signatures": True},
+        )
+        return Response(ConsentAgreementSerializer(renewed_agreement, context={"request": request}).data)
 
 
 class ConsentRevokeView(APIView):
