@@ -185,6 +185,8 @@ class ConsentSignatureView(APIView):
             raise PermissionDenied("Identity verification is required before signing.")
         if request.user not in [agreement.creator, agreement.participant]:
             raise PermissionDenied("Only agreement participants can sign.")
+        if agreement.signatures.filter(signer=request.user).exists():
+            raise ValidationError("You have already signed this agreement.")
         serializer = ConsentSignatureSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         signature = serializer.save(

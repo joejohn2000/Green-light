@@ -362,6 +362,11 @@ class ConsentRepository {
     return Agreement.fromJson(await _api.get('/consents/agreements/$id/'));
   }
 
+  Future<int> currentUserId() async {
+    final userData = await _api.get('/users/me/') as Map<String, dynamic>;
+    return userData['id'];
+  }
+
   Future<Agreement> createAgreement({
     required String participantPhone,
     required String title,
@@ -544,6 +549,21 @@ class Agreement {
           .map((item) => Map<String, dynamic>.from(item))
           .toList(),
     );
+  }
+}
+
+class AgreementDetailData {
+  AgreementDetailData({required this.agreement, required this.currentUserId});
+
+  final Agreement agreement;
+  final int currentUserId;
+
+  bool get currentUserHasSigned {
+    return agreement.signatures.any((item) {
+      final signer = item['signer'];
+      if (signer is int) return signer == currentUserId;
+      return signer?.toString() == currentUserId.toString();
+    });
   }
 }
 
@@ -1157,19 +1177,29 @@ class AgreementDetailScreen extends StatefulWidget {
 }
 
 class _AgreementDetailScreenState extends State<AgreementDetailScreen> {
-  late Future<Agreement> future;
+  late Future<AgreementDetailData> future;
   final signature = TextEditingController();
 
   @override
   void initState() {
     super.initState();
-    future = sl<ConsentRepository>().agreement(widget.agreementId);
+    future = loadAgreementDetail();
+  }
+
+  Future<AgreementDetailData> loadAgreementDetail() async {
+    final repository = sl<ConsentRepository>();
+    final results = await Future.wait<dynamic>([
+      repository.agreement(widget.agreementId),
+      repository.currentUserId(),
+    ]);
+    return AgreementDetailData(
+      agreement: results[0] as Agreement,
+      currentUserId: results[1] as int,
+    );
   }
 
   void reload() {
-    setState(
-      () => future = sl<ConsentRepository>().agreement(widget.agreementId),
-    );
+    setState(() => future = loadAgreementDetail());
   }
 
   Future<void> sign() async {
@@ -1224,7 +1254,7 @@ class _AgreementDetailScreenState extends State<AgreementDetailScreen> {
   Widget build(BuildContext context) {
     return AppScaffold(
       appBar: const GreenLightAppBar(title: 'Agreement'),
-      child: FutureBuilder<Agreement>(
+      child: FutureBuilder<AgreementDetailData>(
         future: future,
         builder: (context, snapshot) {
           if (snapshot.connectionState != ConnectionState.done) {
@@ -1237,11 +1267,12 @@ class _AgreementDetailScreenState extends State<AgreementDetailScreen> {
               action: reload,
             );
           }
-          final agreement = snapshot.data!;
-          final canSign = agreement.status == 'PENDING_SIGNATURES';
-          final canRevoke =
-              agreement.status == 'ACTIVE' ||
-              agreement.status == 'PENDING_SIGNATURES';
+          final detail = snapshot.data!;
+          final agreement = detail.agreement;
+          final canSign =
+              agreement.status == 'PENDING_SIGNATURES' &&
+              !detail.currentUserHasSigned;
+          final canRevoke = agreement.status == 'ACTIVE';
           final canRenew =
               agreement.status == 'EXPIRED' || agreement.status == 'REVOKED';
           return ListView(
