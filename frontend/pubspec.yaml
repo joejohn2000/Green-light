@@ -1,0 +1,30 @@
+name: green_light_mobile
+description: "Green Light consent management mobile app."
+publish_to: "none"
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.8.1
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+  flutter_bloc: ^9.1.1
+  fluttertoast: ^9.0.0
+  get_it: ^9.2.0
+  go_router: ^17.0.0
+  http: ^1.6.0
+  image_picker: ^1.2.1
+  intl: ^0.20.2
+  package_info_plus: ^9.0.0
+  permission_handler: ^12.0.1
+  shared_preferences: ^2.5.3
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+flutter:
+  uses-material-design: true

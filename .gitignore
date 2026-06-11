@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Django/local runtime
+*.sqlite3
+db.sqlite3
+media/
+staticfiles/
+.env
+
+# Flutter/build outputs
+frontend/.dart_tool/
+frontend/build/
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/
