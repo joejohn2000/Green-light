@@ -425,7 +425,11 @@ class ConsentRepository {
     );
   }
 
-  Future<Agreement> sign(int id, String signatureText) async {
+  Future<Agreement> sign(
+    int id,
+    String signatureText, {
+    required XFile livePhoto,
+  }) async {
     final location = await currentLocationFields();
     final data = await _api.multipart(
       '/consents/agreements/$id/sign/',
@@ -434,7 +438,7 @@ class ConsentRepository {
         'device_info': jsonEncode({'platform': devicePlatform()}),
         ...location,
       },
-      files: <String, XFile>{},
+      files: {'signature_image': livePhoto},
     );
     return Agreement.fromJson(data);
   }
@@ -1179,6 +1183,9 @@ class AgreementDetailScreen extends StatefulWidget {
 class _AgreementDetailScreenState extends State<AgreementDetailScreen> {
   late Future<AgreementDetailData> future;
   final signature = TextEditingController();
+  final picker = ImagePicker();
+  XFile? signingPhoto;
+  bool signedLocally = false;
 
   @override
   void initState() {
@@ -1202,16 +1209,41 @@ class _AgreementDetailScreenState extends State<AgreementDetailScreen> {
     setState(() => future = loadAgreementDetail());
   }
 
+  Future<XFile?> pickSigningPhoto() async {
+    final image = await picker.pickImage(
+      source: ImageSource.camera,
+      preferredCameraDevice: CameraDevice.front,
+    );
+    if (image != null) {
+      setState(() => signingPhoto = image);
+    }
+    return image;
+  }
+
   Future<void> sign() async {
     final signatureText = signature.text.trim();
     if (signatureText.isEmpty) {
       toast('Enter your signature name.');
       return;
     }
+    var livePhoto = signingPhoto;
+    livePhoto ??= await pickSigningPhoto();
+    if (livePhoto == null) {
+      toast('Live signing photo is required.');
+      return;
+    }
     try {
-      await sl<ConsentRepository>().sign(widget.agreementId, signatureText);
-      signature.clear();
-      reload();
+      await sl<ConsentRepository>().sign(
+        widget.agreementId,
+        signatureText,
+        livePhoto: livePhoto,
+      );
+      setState(() {
+        signedLocally = true;
+        signingPhoto = null;
+        signature.clear();
+        future = loadAgreementDetail();
+      });
     } catch (error) {
       toast(error.toString());
     }
@@ -1273,7 +1305,8 @@ class _AgreementDetailScreenState extends State<AgreementDetailScreen> {
           final agreement = detail.agreement;
           final canSign =
               agreement.status == 'PENDING_SIGNATURES' &&
-              !detail.currentUserHasSigned;
+              !detail.currentUserHasSigned &&
+              !signedLocally;
           final canRevoke = agreement.status == 'ACTIVE';
           final canRenew =
               agreement.status == 'EXPIRED' || agreement.status == 'REVOKED';
@@ -1306,10 +1339,17 @@ class _AgreementDetailScreenState extends State<AgreementDetailScreen> {
                         ),
                       ),
                       const SizedBox(height: 12),
+                      PickTile(
+                        icon: Icons.face_retouching_natural_rounded,
+                        title: 'Live signing photo',
+                        selected: signingPhoto != null,
+                        onTap: () => pickSigningPhoto(),
+                      ),
+                      const SizedBox(height: 12),
                       FilledButton.icon(
                         onPressed: sign,
-                        icon: const Icon(Icons.edit_document),
-                        label: const Text('Sign agreement'),
+                        icon: const Icon(Icons.verified_user_rounded),
+                        label: const Text('Confirm and sign'),
                       ),
                     ],
                   ),

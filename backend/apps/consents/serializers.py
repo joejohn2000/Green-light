@@ -91,6 +91,13 @@ class ConsentSignatureSerializer(serializers.ModelSerializer):
     def validate_device_info(self, value):
         return normalize_device_info(value)
 
+    def validate(self, attrs):
+        if not attrs.get("signature_text", "").strip():
+            raise serializers.ValidationError({"signature_text": "Signature name is required."})
+        if not attrs.get("signature_image"):
+            raise serializers.ValidationError({"signature_image": "Live signing photo is required."})
+        return attrs
+
 
 class ConsentAgreementSerializer(serializers.ModelSerializer):
     creator_name = serializers.CharField(source="creator.get_full_name", read_only=True)
