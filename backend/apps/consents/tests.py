@@ -1,9 +1,11 @@
 import shutil
 import tempfile
+from datetime import timedelta
 
 from django.contrib.auth import get_user_model
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import override_settings
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APITestCase
 
@@ -108,3 +110,21 @@ class ConsentSignatureTests(APITestCase):
         self.agreement.refresh_from_db()
         self.assertEqual(self.agreement.status, ConsentAgreement.Status.ACTIVE)
         self.assertEqual(self.agreement.signatures.count(), 2)
+
+    def test_custom_renewal_accepts_calendar_expiration_without_preset_duration(self):
+        self.client.force_authenticate(self.creator)
+        next_expiration = timezone.now() + timedelta(days=1)
+
+        response = self.client.post(
+            f"/api/consents/agreements/{self.agreement.id}/renew/",
+            {
+                "duration_hours": "23",
+                "requested_expires_at": next_expiration.isoformat(),
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.agreement.refresh_from_db()
+        self.assertEqual(self.agreement.status, ConsentAgreement.Status.PENDING_SIGNATURES)
+        self.assertIsNotNone(self.agreement.requested_expires_at)

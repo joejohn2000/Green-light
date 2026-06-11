@@ -167,7 +167,7 @@ class ConsentAgreementSerializer(serializers.ModelSerializer):
 
 
 class ConsentRenewSerializer(serializers.Serializer):
-    duration_hours = serializers.ChoiceField(choices=[24, 168, 720], required=False)
+    duration_hours = serializers.IntegerField(required=False, min_value=1, max_value=8760)
     requested_expires_at = serializers.DateTimeField(required=False)
 
     def validate(self, attrs):
@@ -175,6 +175,10 @@ class ConsentRenewSerializer(serializers.Serializer):
             raise serializers.ValidationError("Select a duration or custom expiration date.")
         if attrs.get("requested_expires_at") and attrs["requested_expires_at"] <= timezone.now():
             raise serializers.ValidationError("Expiration date must be in the future.")
+        if attrs.get("requested_expires_at"):
+            return attrs
+        if attrs.get("duration_hours") not in {24, 168, 720}:
+            raise serializers.ValidationError({"duration_hours": "Duration must be 24 hours, 7 days, or 30 days."})
         return attrs
 
     def create(self, validated_data):

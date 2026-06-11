@@ -445,12 +445,12 @@ class ConsentRepository {
 
   Future<Agreement> renew(
     int id,
-    int durationHours, {
+    int? durationHours, {
     DateTime? requestedExpiresAt,
   }) async {
     return Agreement.fromJson(
       await _api.post('/consents/agreements/$id/renew/', {
-        'duration_hours': durationHours,
+        if (durationHours != null) 'duration_hours': durationHours,
         if (requestedExpiresAt != null)
           'requested_expires_at': requestedExpiresAt.toUtc().toIso8601String(),
       }),
@@ -1258,7 +1258,7 @@ class _AgreementDetailScreenState extends State<AgreementDetailScreen> {
       if (nextExpiration == null) return;
       final renewed = await sl<ConsentRepository>().renew(
         widget.agreementId,
-        nextExpiration.difference(DateTime.now()).inHours.clamp(1, 8760),
+        null,
         requestedExpiresAt: nextExpiration,
       );
       if (mounted) context.go('/agreements/${renewed.id}');
