@@ -26,6 +26,12 @@ class IdentityVerification(models.Model):
     selfie_match_score = models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True)
     failure_reason = models.TextField(blank=True)
     device_info = models.JSONField(default=dict, blank=True)
+    latitude = models.DecimalField(max_digits=9, decimal_places=6, null=True, blank=True)
+    longitude = models.DecimalField(max_digits=9, decimal_places=6, null=True, blank=True)
+    location_confirmed = models.BooleanField(default=False)
+    facial_verification_confirmed = models.BooleanField(default=False)
+    device_authenticated = models.BooleanField(default=False)
+    security_checks_passed = models.BooleanField(default=False)
     submitted_at = models.DateTimeField(auto_now_add=True)
     verified_at = models.DateTimeField(null=True, blank=True)
 
@@ -35,10 +41,22 @@ class IdentityVerification(models.Model):
     def mark_verified(self, score=None):
         self.status = self.Status.VERIFIED
         self.selfie_match_score = score
+        self.facial_verification_confirmed = True
+        self.device_authenticated = True
+        self.security_checks_passed = True
         self.verified_at = timezone.now()
         self.user.is_identity_verified = True
         self.user.save(update_fields=["is_identity_verified"])
-        self.save(update_fields=["status", "selfie_match_score", "verified_at"])
+        self.save(
+            update_fields=[
+                "status",
+                "selfie_match_score",
+                "facial_verification_confirmed",
+                "device_authenticated",
+                "security_checks_passed",
+                "verified_at",
+            ]
+        )
 
     def __str__(self):
         return f"{self.user_id} - {self.status}"
@@ -60,6 +78,7 @@ class ConsentAgreement(models.Model):
     status = models.CharField(max_length=30, choices=Status.choices, default=Status.PENDING_SIGNATURES)
     starts_at = models.DateTimeField(null=True, blank=True)
     expires_at = models.DateTimeField(null=True, blank=True)
+    requested_expires_at = models.DateTimeField(null=True, blank=True)
     previous_agreement = models.ForeignKey("self", on_delete=models.SET_NULL, null=True, blank=True, related_name="renewals")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -76,7 +95,7 @@ class ConsentAgreement(models.Model):
             now = timezone.now()
             self.status = self.Status.ACTIVE
             self.starts_at = now
-            self.expires_at = now + timedelta(hours=self.duration_hours)
+            self.expires_at = self.requested_expires_at or now + timedelta(hours=self.duration_hours)
             self.save(update_fields=["status", "starts_at", "expires_at", "updated_at"])
             return True
         return False
@@ -100,6 +119,10 @@ class ConsentSignature(models.Model):
     ip_address = models.GenericIPAddressField(null=True, blank=True)
     user_agent = models.TextField(blank=True)
     device_info = models.JSONField(default=dict, blank=True)
+    latitude = models.DecimalField(max_digits=9, decimal_places=6, null=True, blank=True)
+    longitude = models.DecimalField(max_digits=9, decimal_places=6, null=True, blank=True)
+    location_confirmed = models.BooleanField(default=False)
+    verification_status = models.CharField(max_length=20, default="VERIFIED")
     signed_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:

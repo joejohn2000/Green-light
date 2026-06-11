@@ -4,12 +4,14 @@ import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:fluttertoast/fluttertoast.dart';
+import 'package:geolocator/geolocator.dart';
 import 'package:get_it/get_it.dart';
 import 'package:go_router/go_router.dart';
 import 'package:http/http.dart' as http;
 import 'package:image_picker/image_picker.dart';
 import 'package:intl/intl.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 final sl = GetIt.instance;
 
@@ -18,6 +20,7 @@ Future<void> main() async {
   final storage = AppStorage();
   await storage.init();
   sl.registerSingleton<AppStorage>(storage);
+  sl.registerSingleton<AppThemeController>(AppThemeController(storage));
   sl.registerLazySingleton<ApiClient>(() => ApiClient(storage));
   sl.registerLazySingleton<AuthRepository>(() => AuthRepository(sl()));
   sl.registerLazySingleton<ConsentRepository>(() => ConsentRepository(sl()));
@@ -62,28 +65,92 @@ class GreenLightApp extends StatelessWidget {
       ],
     );
 
-    return MaterialApp.router(
-      title: 'Green Light',
-      debugShowCheckedModeBanner: false,
-      routerConfig: router,
-      theme: ThemeData(
-        useMaterial3: true,
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: const Color(0xFF1E8A5A),
-          primary: const Color(0xFF14764A),
-          secondary: const Color(0xFF28527A),
-          tertiary: const Color(0xFFE7A928),
-          surface: const Color(0xFFF8FAF8),
-        ),
-        scaffoldBackgroundColor: const Color(0xFFF8FAF8),
-        inputDecorationTheme: const InputDecorationTheme(
-          border: OutlineInputBorder(),
-          filled: true,
-          fillColor: Colors.white,
-        ),
-      ),
+    return ValueListenableBuilder<ThemeMode>(
+      valueListenable: sl<AppThemeController>(),
+      builder: (context, themeMode, _) {
+        return MaterialApp.router(
+          title: 'Green Light',
+          debugShowCheckedModeBanner: false,
+          routerConfig: router,
+          theme: buildAppTheme(Brightness.light),
+          darkTheme: buildAppTheme(Brightness.dark),
+          themeMode: themeMode,
+        );
+      },
     );
   }
+}
+
+ThemeData buildAppTheme(Brightness brightness) {
+  final isDark = brightness == Brightness.dark;
+  final scheme = ColorScheme.fromSeed(
+    seedColor: const Color(0xFF14764A),
+    brightness: brightness,
+    primary: isDark ? const Color(0xFF67D19C) : const Color(0xFF14764A),
+    secondary: isDark ? const Color(0xFF8DB8E8) : const Color(0xFF28527A),
+    tertiary: isDark ? const Color(0xFFFFD166) : const Color(0xFFE7A928),
+    surface: isDark ? const Color(0xFF111816) : const Color(0xFFF8FAF8),
+  );
+
+  return ThemeData(
+    useMaterial3: true,
+    brightness: brightness,
+    colorScheme: scheme,
+    scaffoldBackgroundColor: scheme.surface,
+    appBarTheme: AppBarTheme(
+      elevation: 0,
+      centerTitle: false,
+      backgroundColor: scheme.surface,
+      foregroundColor: scheme.onSurface,
+      surfaceTintColor: Colors.transparent,
+      titleTextStyle: TextStyle(
+        color: scheme.onSurface,
+        fontSize: 20,
+        fontWeight: FontWeight.w700,
+      ),
+    ),
+    cardTheme: CardThemeData(
+      elevation: 0,
+      color: isDark ? const Color(0xFF17211E) : Colors.white,
+      surfaceTintColor: Colors.transparent,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(8),
+        side: BorderSide(
+          color: isDark ? const Color(0xFF2B3A35) : const Color(0xFFE0E7E2),
+        ),
+      ),
+    ),
+    inputDecorationTheme: InputDecorationTheme(
+      border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+      enabledBorder: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(8),
+        borderSide: BorderSide(
+          color: isDark ? const Color(0xFF344740) : const Color(0xFFD6E1D9),
+        ),
+      ),
+      filled: true,
+      fillColor: isDark ? const Color(0xFF101715) : Colors.white,
+    ),
+    filledButtonTheme: FilledButtonThemeData(
+      style: FilledButton.styleFrom(
+        minimumSize: const Size.fromHeight(48),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+      ),
+    ),
+    floatingActionButtonTheme: FloatingActionButtonThemeData(
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+      backgroundColor: scheme.primary,
+      foregroundColor: scheme.onPrimary,
+    ),
+    iconButtonTheme: IconButtonThemeData(
+      style: IconButton.styleFrom(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+      ),
+    ),
+    listTileTheme: ListTileThemeData(
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+    ),
+  );
 }
 
 class ApiUrls {
@@ -102,6 +169,12 @@ class AppStorage {
 
   String? get accessToken => _prefs.getString('access_token');
   String? get refreshToken => _prefs.getString('refresh_token');
+  ThemeMode get themeMode {
+    final value = _prefs.getString('theme_mode');
+    if (value == 'dark') return ThemeMode.dark;
+    if (value == 'light') return ThemeMode.light;
+    return ThemeMode.system;
+  }
 
   Future<void> saveTokens(String access, String refresh) async {
     await _prefs.setString('access_token', access);
@@ -111,6 +184,23 @@ class AppStorage {
   Future<void> clear() async {
     await _prefs.remove('access_token');
     await _prefs.remove('refresh_token');
+  }
+
+  Future<void> saveThemeMode(ThemeMode mode) async {
+    await _prefs.setString('theme_mode', mode.name);
+  }
+}
+
+class AppThemeController extends ValueNotifier<ThemeMode> {
+  AppThemeController(this._storage) : super(_storage.themeMode);
+
+  final AppStorage _storage;
+
+  bool get isDarkMode => value == ThemeMode.dark;
+
+  Future<void> toggle() async {
+    value = value == ThemeMode.dark ? ThemeMode.light : ThemeMode.dark;
+    await _storage.saveThemeMode(value);
   }
 }
 
@@ -157,11 +247,20 @@ class ApiClient {
     return headers;
   }
 
+  Uri authenticatedUri(String endpoint) {
+    final uri = Uri.parse('${ApiUrls.baseUrl}$endpoint');
+    final token = _storage.accessToken;
+    if (token == null || token.isEmpty) return uri;
+    return uri.replace(
+      queryParameters: {...uri.queryParameters, 'access_token': token},
+    );
+  }
+
   Future<dynamic> get(String endpoint) async {
     final response = await http
         .get(Uri.parse('${ApiUrls.baseUrl}$endpoint'), headers: _headers)
         .timeout(const Duration(seconds: 30));
-    return _decode(response);
+    return await _decode(response);
   }
 
   Future<dynamic> post(String endpoint, Map<String, dynamic> body) async {
@@ -172,7 +271,7 @@ class ApiClient {
           body: jsonEncode(body),
         )
         .timeout(const Duration(seconds: 30));
-    return _decode(response);
+    return await _decode(response);
   }
 
   Future<dynamic> multipart(
@@ -201,12 +300,18 @@ class ApiClient {
       );
     }
     final streamed = await request.send().timeout(const Duration(seconds: 60));
-    return _decode(await http.Response.fromStream(streamed));
+    return await _decode(await http.Response.fromStream(streamed));
   }
 
-  dynamic _decode(http.Response response) {
+  Future<dynamic> _decode(http.Response response) async {
     final body = response.body.isEmpty ? null : jsonDecode(response.body);
     if (response.statusCode >= 200 && response.statusCode < 300) return body;
+
+    if (response.statusCode == 401) {
+      await sl<AppSession>().logout();
+      throw ApiException('Session expired. Please sign in again.');
+    }
+
     final message = body is Map
         ? body.values.map((value) => value.toString()).join('\n')
         : 'Request failed with status ${response.statusCode}';
@@ -262,49 +367,79 @@ class ConsentRepository {
     required String title,
     required String terms,
     required int durationHours,
+    DateTime? requestedExpiresAt,
   }) async {
     final data = await _api.post('/consents/agreements/', {
       'participant_phone_number': participantPhone,
       'title': title,
       'terms': terms,
       'duration_hours': durationHours,
+      if (requestedExpiresAt != null)
+        'requested_expires_at': requestedExpiresAt.toUtc().toIso8601String(),
     });
     return Agreement.fromJson(data);
   }
 
-  Future<void> submitIdentity({
+  Future<IdentityVerificationRecord> submitIdentity({
     required XFile selfie,
     required XFile governmentId,
     required String documentType,
     required String lastFour,
   }) async {
-    await _api.multipart(
+    final location = await currentLocationFields();
+    final data = await _api.multipart(
       '/consents/identity-verifications/',
       fields: {
         'document_type': documentType,
         'document_last_four': lastFour,
         'device_info': jsonEncode({'platform': devicePlatform()}),
+        ...location,
       },
       files: {'selfie_image': selfie, 'government_id_image': governmentId},
+    );
+    return IdentityVerificationRecord.fromJson(data);
+  }
+
+  Future<IdentityBadgeState> identityBadgeState() async {
+    final userData = await _api.get('/users/me/') as Map<String, dynamic>;
+    final isUserVerified = userData['is_identity_verified'] == true;
+    final verificationData =
+        await _api.get('/consents/identity-verifications/') as List<dynamic>;
+    final latest = verificationData.isEmpty
+        ? null
+        : IdentityVerificationRecord.fromJson(
+            Map<String, dynamic>.from(verificationData.first),
+          );
+    final status = isUserVerified
+        ? 'VERIFIED'
+        : latest?.status ?? 'NOT_SUBMITTED';
+
+    return IdentityBadgeState(
+      status: status,
+      isVerified: isUserVerified || latest?.status == 'VERIFIED',
     );
   }
 
   Future<Agreement> sign(int id, String signatureText) async {
+    final location = await currentLocationFields();
     final data = await _api.multipart(
       '/consents/agreements/$id/sign/',
       fields: {
         'signature_text': signatureText,
         'device_info': jsonEncode({'platform': devicePlatform()}),
+        ...location,
       },
       files: <String, XFile>{},
     );
     return Agreement.fromJson(data);
   }
 
-  Future<Agreement> renew(int id, int durationHours) async {
+  Future<Agreement> renew(int id, int durationHours, {DateTime? requestedExpiresAt}) async {
     return Agreement.fromJson(
       await _api.post('/consents/agreements/$id/renew/', {
         'duration_hours': durationHours,
+        if (requestedExpiresAt != null)
+          'requested_expires_at': requestedExpiresAt.toUtc().toIso8601String(),
       }),
     );
   }
@@ -320,11 +455,45 @@ class ConsentRepository {
         await _api.get('/consents/agreements/$id/audit/') as List<dynamic>;
     return data.map((item) => AuditEntry.fromJson(item)).toList();
   }
+
+  Future<void> downloadAgreementPdf(int id) async {
+    final uri = _api.authenticatedUri('/consents/agreements/$id/download/');
+    final launched = await launchUrl(uri, mode: LaunchMode.externalApplication);
+    if (!launched) {
+      throw ApiException('Could not open agreement PDF.');
+    }
+  }
 }
 
 String devicePlatform() {
   if (kIsWeb) return 'web';
   return defaultTargetPlatform.name;
+}
+
+Future<Map<String, String>> currentLocationFields() async {
+  try {
+    var permission = await Geolocator.checkPermission();
+    if (permission == LocationPermission.denied) {
+      permission = await Geolocator.requestPermission();
+    }
+    if (permission == LocationPermission.denied ||
+        permission == LocationPermission.deniedForever) {
+      return {'location_confirmed': 'false'};
+    }
+    final position = await Geolocator.getCurrentPosition(
+      locationSettings: const LocationSettings(
+        accuracy: LocationAccuracy.high,
+        timeLimit: Duration(seconds: 10),
+      ),
+    );
+    return {
+      'latitude': position.latitude.toStringAsFixed(6),
+      'longitude': position.longitude.toStringAsFixed(6),
+      'location_confirmed': 'true',
+    };
+  } catch (_) {
+    return {'location_confirmed': 'false'};
+  }
 }
 
 class Agreement {
@@ -387,6 +556,23 @@ class AuditEntry {
       createdAt: DateTime.parse(json['created_at']),
     );
   }
+}
+
+class IdentityVerificationRecord {
+  IdentityVerificationRecord({required this.status});
+
+  final String status;
+
+  factory IdentityVerificationRecord.fromJson(Map<String, dynamic> json) {
+    return IdentityVerificationRecord(status: json['status'] ?? 'PENDING');
+  }
+}
+
+class IdentityBadgeState {
+  IdentityBadgeState({required this.status, required this.isVerified});
+
+  final String status;
+  final bool isVerified;
 }
 
 class SplashScreen extends StatefulWidget {
@@ -594,13 +780,17 @@ class _IdentityScreenState extends State<IdentityScreen> {
     }
     setState(() => loading = true);
     try {
-      await sl<ConsentRepository>().submitIdentity(
+      final verification = await sl<ConsentRepository>().submitIdentity(
         selfie: selfie!,
         governmentId: governmentId!,
         documentType: documentType,
         lastFour: lastFour.text.trim(),
       );
-      toast('Identity verification submitted.');
+      toast(
+        verification.status == 'VERIFIED'
+            ? 'Identity verified.'
+            : 'Identity verification submitted.',
+      );
       if (mounted) context.go('/agreements');
     } catch (error) {
       toast(error.toString());
@@ -692,11 +882,20 @@ class AgreementListScreen extends StatefulWidget {
 
 class _AgreementListScreenState extends State<AgreementListScreen> {
   late Future<List<Agreement>> future;
+  late Future<IdentityBadgeState> identityFuture;
 
   @override
   void initState() {
     super.initState();
     future = sl<ConsentRepository>().agreements();
+    identityFuture = sl<ConsentRepository>().identityBadgeState();
+  }
+
+  void reload() {
+    setState(() {
+      future = sl<ConsentRepository>().agreements();
+      identityFuture = sl<ConsentRepository>().identityBadgeState();
+    });
   }
 
   @override
@@ -705,11 +904,18 @@ class _AgreementListScreenState extends State<AgreementListScreen> {
       appBar: GreenLightAppBar(
         title: 'Agreements',
         actions: [
-          IconButton(
-            tooltip: 'Verify identity',
-            onPressed: () => context.go('/verify'),
-            icon: const Icon(Icons.verified_rounded),
+          FutureBuilder<IdentityBadgeState>(
+            future: identityFuture,
+            builder: (context, snapshot) {
+              final identity = snapshot.data;
+              final isVerified = identity?.isVerified == true;
+              return VerifiedIdentityButton(
+                isVerified: isVerified,
+                onPressed: () => context.go('/verify'),
+              );
+            },
           ),
+          const ThemeModeButton(),
           IconButton(
             tooltip: 'Sign out',
             onPressed: () => sl<AppSession>().logout(),
@@ -732,8 +938,7 @@ class _AgreementListScreenState extends State<AgreementListScreen> {
             return EmptyState(
               icon: Icons.warning_amber_rounded,
               title: 'Unable to load agreements',
-              action: () =>
-                  setState(() => future = sl<ConsentRepository>().agreements()),
+              action: reload,
             );
           }
           final agreements = snapshot.data ?? [];
@@ -1108,6 +1313,70 @@ class GreenLightAppBar extends StatelessWidget implements PreferredSizeWidget {
   }
 }
 
+class ThemeModeButton extends StatelessWidget {
+  const ThemeModeButton({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return ValueListenableBuilder<ThemeMode>(
+      valueListenable: sl<AppThemeController>(),
+      builder: (context, mode, _) {
+        final isDark = mode == ThemeMode.dark;
+        return IconButton(
+          tooltip: isDark ? 'Light mode' : 'Dark mode',
+          onPressed: sl<AppThemeController>().toggle,
+          icon: Icon(
+            isDark ? Icons.light_mode_rounded : Icons.dark_mode_rounded,
+          ),
+        );
+      },
+    );
+  }
+}
+
+class VerifiedIdentityButton extends StatelessWidget {
+  const VerifiedIdentityButton({
+    required this.isVerified,
+    required this.onPressed,
+    super.key,
+  });
+
+  final bool isVerified;
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    const verifiedBlue = Color(0xFF1976D2);
+    final scheme = Theme.of(context).colorScheme;
+    final color = isVerified ? verifiedBlue : scheme.onSurfaceVariant;
+
+    return IconButton(
+      tooltip: isVerified ? 'Identity verified' : 'Verify identity',
+      onPressed: onPressed,
+      icon: Container(
+        width: 34,
+        height: 34,
+        decoration: BoxDecoration(
+          color: isVerified
+              ? verifiedBlue.withValues(alpha: 0.12)
+              : scheme.surfaceContainerHighest,
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(
+            color: isVerified
+                ? verifiedBlue.withValues(alpha: 0.45)
+                : scheme.outlineVariant,
+          ),
+        ),
+        child: Icon(
+          isVerified ? Icons.verified_rounded : Icons.verified_outlined,
+          color: color,
+          size: 20,
+        ),
+      ),
+    );
+  }
+}
+
 class AuthPanel extends StatelessWidget {
   const AuthPanel({
     required this.title,
@@ -1163,7 +1432,14 @@ class BrandMark extends StatelessWidget {
         height: 74,
         decoration: BoxDecoration(
           shape: BoxShape.circle,
-          color: Theme.of(context).colorScheme.primary,
+          gradient: LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: [
+              Theme.of(context).colorScheme.primary,
+              Theme.of(context).colorScheme.secondary,
+            ],
+          ),
         ),
         child: const Icon(Icons.check_rounded, color: Colors.white, size: 42),
       ),
@@ -1179,11 +1455,6 @@ class SectionCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Card(
-      elevation: 0,
-      shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(8),
-        side: BorderSide(color: Theme.of(context).colorScheme.outlineVariant),
-      ),
       child: Padding(padding: const EdgeInsets.all(18), child: child),
     );
   }
@@ -1205,14 +1476,15 @@ class PickTile extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
     return ListTile(
       onTap: onTap,
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-      tileColor: Colors.white,
-      leading: Icon(icon),
+      tileColor: scheme.surfaceContainerHighest.withValues(alpha: 0.48),
+      leading: Icon(icon, color: selected ? scheme.primary : scheme.secondary),
       title: Text(title),
       trailing: Icon(
         selected ? Icons.check_circle_rounded : Icons.camera_alt_rounded,
+        color: selected ? scheme.primary : scheme.onSurfaceVariant,
       ),
     );
   }
@@ -1239,10 +1511,13 @@ class AgreementTile extends StatelessWidget {
               width: 46,
               height: 46,
               decoration: BoxDecoration(
-                color: Theme.of(context).colorScheme.secondaryContainer,
+                color: Theme.of(context).colorScheme.primaryContainer,
                 borderRadius: BorderRadius.circular(8),
               ),
-              child: const Icon(Icons.assignment_rounded),
+              child: Icon(
+                Icons.assignment_rounded,
+                color: Theme.of(context).colorScheme.onPrimaryContainer,
+              ),
             ),
             const SizedBox(width: 12),
             Expanded(

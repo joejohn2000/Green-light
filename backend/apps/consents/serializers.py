@@ -2,6 +2,7 @@ import json
 
 from django.contrib.auth import get_user_model
 from django.db.models import Q
+from django.utils import timezone
 from rest_framework import serializers
 
 from .models import AuditLog, ConsentAgreement, ConsentSignature, IdentityVerification
@@ -38,10 +39,26 @@ class IdentityVerificationSerializer(serializers.ModelSerializer):
             "selfie_match_score",
             "failure_reason",
             "device_info",
+            "latitude",
+            "longitude",
+            "location_confirmed",
+            "facial_verification_confirmed",
+            "device_authenticated",
+            "security_checks_passed",
             "submitted_at",
             "verified_at",
         )
-        read_only_fields = ("id", "status", "selfie_match_score", "failure_reason", "submitted_at", "verified_at")
+        read_only_fields = (
+            "id",
+            "status",
+            "selfie_match_score",
+            "failure_reason",
+            "facial_verification_confirmed",
+            "device_authenticated",
+            "security_checks_passed",
+            "submitted_at",
+            "verified_at",
+        )
 
     def validate_device_info(self, value):
         return normalize_device_info(value)
@@ -63,9 +80,13 @@ class ConsentSignatureSerializer(serializers.ModelSerializer):
             "ip_address",
             "user_agent",
             "device_info",
+            "latitude",
+            "longitude",
+            "location_confirmed",
+            "verification_status",
             "signed_at",
         )
-        read_only_fields = ("id", "signer", "ip_address", "user_agent", "signed_at")
+        read_only_fields = ("id", "signer", "ip_address", "user_agent", "verification_status", "signed_at")
 
     def validate_device_info(self, value):
         return normalize_device_info(value)
@@ -92,6 +113,7 @@ class ConsentAgreementSerializer(serializers.ModelSerializer):
             "status",
             "starts_at",
             "expires_at",
+            "requested_expires_at",
             "previous_agreement",
             "signatures",
             "created_at",
@@ -114,6 +136,11 @@ class ConsentAgreementSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError("Duration must be 24 hours, 7 days, or 30 days.")
         return value
 
+    def validate_requested_expires_at(self, value):
+        if value and value <= timezone.now():
+            raise serializers.ValidationError("Expiration date must be in the future.")
+        return value
+
     def validate(self, attrs):
         request = self.context["request"]
         participant_phone_number = attrs.pop("participant_phone_number")
@@ -133,7 +160,15 @@ class ConsentAgreementSerializer(serializers.ModelSerializer):
 
 
 class ConsentRenewSerializer(serializers.Serializer):
-    duration_hours = serializers.ChoiceField(choices=[24, 168, 720])
+    duration_hours = serializers.ChoiceField(choices=[24, 168, 720], required=False)
+    requested_expires_at = serializers.DateTimeField(required=False)
+
+    def validate(self, attrs):
+        if not attrs.get("duration_hours") and not attrs.get("requested_expires_at"):
+            raise serializers.ValidationError("Select a duration or custom expiration date.")
+        if attrs.get("requested_expires_at") and attrs["requested_expires_at"] <= timezone.now():
+            raise serializers.ValidationError("Expiration date must be in the future.")
+        return attrs
 
     def create(self, validated_data):
         agreement = self.context["agreement"]
@@ -143,7 +178,8 @@ class ConsentRenewSerializer(serializers.Serializer):
             participant=agreement.participant if agreement.creator == request.user else agreement.creator,
             title=agreement.title,
             terms=agreement.terms,
-            duration_hours=validated_data["duration_hours"],
+            duration_hours=validated_data.get("duration_hours") or agreement.duration_hours,
+            requested_expires_at=validated_data.get("requested_expires_at"),
             previous_agreement=agreement,
         )
 
