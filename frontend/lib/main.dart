@@ -10,6 +10,8 @@ import 'package:go_router/go_router.dart';
 import 'package:http/http.dart' as http;
 import 'package:image_picker/image_picker.dart';
 import 'package:intl/intl.dart';
+import 'package:flutter/services.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 
@@ -24,6 +26,7 @@ Future<void> main() async {
   sl.registerLazySingleton<ApiClient>(() => ApiClient(storage));
   sl.registerLazySingleton<AuthRepository>(() => AuthRepository(sl()));
   sl.registerLazySingleton<ConsentRepository>(() => ConsentRepository(sl()));
+  sl.registerLazySingleton<LocalConsentStore>(() => LocalConsentStore(storage));
   sl.registerSingleton<AppSession>(AppSession(storage));
   runApp(const GreenLightApp());
 }
@@ -37,17 +40,8 @@ class GreenLightApp extends StatelessWidget {
     final router = GoRouter(
       refreshListenable: session,
       initialLocation: '/',
-      redirect: (context, state) {
-        final loggedIn = session.isLoggedIn;
-        final publicPath =
-            state.matchedLocation == '/login' ||
-            state.matchedLocation == '/register';
-        if (!loggedIn && !publicPath) return '/login';
-        if (loggedIn && publicPath) return '/agreements';
-        return null;
-      },
       routes: [
-        GoRoute(path: '/', builder: (_, __) => const SplashScreen()),
+        GoRoute(path: '/', builder: (_, __) => const LocalTouchConsentScreen()),
         GoRoute(path: '/login', builder: (_, __) => const LoginScreen()),
         GoRoute(path: '/register', builder: (_, __) => const RegisterScreen()),
         GoRoute(path: '/verify', builder: (_, __) => const IdentityScreen()),
@@ -156,11 +150,430 @@ ThemeData buildAppTheme(Brightness brightness) {
 class ApiUrls {
   static const baseUrl = String.fromEnvironment(
     'API_BASE_URL',
-    defaultValue: 'http://127.0.0.1:8000/api',
+    defaultValue: 'https://green-light-e9mq.onrender.com/api',
   );
 }
 
+class LocalConsentRecord {
+  LocalConsentRecord({
+    required this.id,
+    required this.requesterName,
+    required this.holderName,
+    required this.status,
+    required this.createdAt,
+    this.signedAt,
+    this.cancelledAt,
+  });
+
+  final String id;
+  final String requesterName;
+  final String holderName;
+  final String status;
+  final DateTime createdAt;
+  final DateTime? signedAt;
+  final DateTime? cancelledAt;
+
+  Map<String, dynamic> toJson() {
+    return {
+      'id': id,
+      'requester_name': requesterName,
+      'holder_name': holderName,
+      'status': status,
+      'created_at': createdAt.toIso8601String(),
+      if (signedAt != null) 'signed_at': signedAt!.toIso8601String(),
+      if (cancelledAt != null) 'cancelled_at': cancelledAt!.toIso8601String(),
+    };
+  }
+
+  factory LocalConsentRecord.fromJson(Map<String, dynamic> json) {
+    return LocalConsentRecord(
+      id: json['id'] ?? '',
+      requesterName: json['requester_name'] ?? 'User 1',
+      holderName: json['holder_name'] ?? 'Your name',
+      status: json['status'] ?? 'pending',
+      createdAt: DateTime.tryParse(json['created_at'] ?? '') ?? DateTime.now(),
+      signedAt: json['signed_at'] == null
+          ? null
+          : DateTime.tryParse(json['signed_at']),
+      cancelledAt: json['cancelled_at'] == null
+          ? null
+          : DateTime.tryParse(json['cancelled_at']),
+    );
+  }
+}
+
+String cleanLocalPartyName(String value, String fallback) {
+  final normalized = value.trim();
+  if (normalized.isEmpty ||
+      normalized == 'YOUR NAME' ||
+      normalized.toLowerCase() == 'bla') {
+    return fallback;
+  }
+  return normalized;
+}
+
+class LocalUserProfile {
+  LocalUserProfile({
+    required this.name,
+    required this.idNumber,
+    required this.confirmedAt,
+  });
+
+  final String name;
+  final String idNumber;
+  final DateTime confirmedAt;
+
+  String get maskedId {
+    if (idNumber.length <= 4) return idNumber;
+    return '•••• ${idNumber.substring(idNumber.length - 4)}';
+  }
+
+  Map<String, dynamic> toJson() {
+    return {
+      'name': name,
+      'id_number': idNumber,
+      'confirmed_at': confirmedAt.toIso8601String(),
+    };
+  }
+
+  factory LocalUserProfile.fromJson(Map<String, dynamic> json) {
+    return LocalUserProfile(
+      name: json['name'] ?? '',
+      idNumber: json['id_number'] ?? '',
+      confirmedAt:
+          DateTime.tryParse(json['confirmed_at'] ?? '') ?? DateTime.now(),
+    );
+  }
+}
+
+class LocalConsentStore {
+  LocalConsentStore(this._storage);
+
+  final AppStorage _storage;
+
+  Future<List<LocalConsentRecord>> records() {
+    return _storage.localConsentRecords();
+  }
+
+  Future<String> displayName() async {
+    return _storage.localDisplayName;
+  }
+
+  Future<LocalUserProfile?> profile() async {
+    return _storage.localUserProfile();
+  }
+
+  Future<void> saveProfile({
+    required String name,
+    required String idNumber,
+  }) async {
+    final profile = LocalUserProfile(
+      name: name.trim(),
+      idNumber: idNumber.trim(),
+      confirmedAt: DateTime.now(),
+    );
+    await _storage.saveLocalUserProfile(profile);
+    await _storage.saveLocalDisplayName(profile.name);
+  }
+
+  Future<void> saveDisplayName(String value) async {
+    await _storage.saveLocalDisplayName(
+      value.trim().isEmpty ? 'Your name' : value.trim(),
+    );
+  }
+
+  Future<LocalConsentRecord> saveDecision({
+    required String requesterName,
+    required String holderName,
+    required bool accepted,
+  }) async {
+    final now = DateTime.now();
+    final record = LocalConsentRecord(
+      id: now.microsecondsSinceEpoch.toString(),
+      requesterName: requesterName.trim().isEmpty
+          ? 'User 1'
+          : requesterName.trim(),
+      holderName: holderName.trim().isEmpty ? 'Your name' : holderName.trim(),
+      status: accepted ? 'signed' : 'cancelled',
+      createdAt: now,
+      signedAt: accepted ? now : null,
+      cancelledAt: accepted ? null : now,
+    );
+    final existing = await records();
+    await _storage.saveLocalConsentRecords(
+      [record, ...existing].take(20).toList(),
+    );
+    return record;
+  }
+}
+
+class NearbyPermissionRequirement {
+  const NearbyPermissionRequirement({
+    required this.id,
+    required this.label,
+    required this.description,
+    required this.permission,
+    required this.status,
+  });
+
+  final String id;
+  final String label;
+  final String description;
+  final Permission permission;
+  final PermissionStatus status;
+
+  bool get isGranted => status.isGranted || status.isLimited;
+  bool get needsSettings => status.isPermanentlyDenied || status.isRestricted;
+}
+
+class NearbyConsentTransport {
+  NearbyConsentTransport({
+    required this.onIncomingRequest,
+    required this.onStatusChanged,
+    required this.onPermissionRequired,
+  });
+
+  static const _channel = MethodChannel('green_light/nearby');
+
+  final ValueChanged<String> onIncomingRequest;
+  final ValueChanged<String> onStatusChanged;
+  final ValueChanged<String> onPermissionRequired;
+
+  bool get isSupported =>
+      !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
+
+  Future<void> start(
+    LocalUserProfile profile, {
+    bool requestPermissions = false,
+  }) async {
+    _channel.setMethodCallHandler(_handleNativeEvent);
+    if (!isSupported) {
+      onStatusChanged('Nearby works on a real Android phone build.');
+      return;
+    }
+    if (requestPermissions) {
+      await requestMissingPermissions();
+    }
+    final missingPermissions = await missingPermissionRequirements();
+    if (missingPermissions.isNotEmpty) {
+      onPermissionRequired('Allow nearby permissions to scan for users.');
+      return;
+    }
+    try {
+      await _channel.invokeMethod('start', {
+        'displayName': profile.name,
+        'idSuffix': profile.maskedId,
+      });
+      onStatusChanged('Scanning nearby devices');
+    } on PlatformException catch (error) {
+      onStatusChanged(error.message ?? 'Could not start nearby.');
+    }
+  }
+
+  Future<void> requestPermissionsOnOpen() async {
+    _channel.setMethodCallHandler(_handleNativeEvent);
+    if (!isSupported) {
+      onStatusChanged('Nearby works on a real Android phone build.');
+      return;
+    }
+    final missingBeforeRequest = await missingPermissionRequirements();
+    if (missingBeforeRequest.isEmpty) {
+      onStatusChanged(
+        'Nearby permissions are ready. Confirm identity to scan.',
+      );
+      return;
+    }
+    await requestMissingPermissions();
+    final missingAfterRequest = await missingPermissionRequirements();
+    if (missingAfterRequest.isEmpty) {
+      onStatusChanged(
+        'Nearby permissions are ready. Confirm identity to scan.',
+      );
+    } else {
+      onPermissionRequired('Allow nearby permissions to scan for users.');
+    }
+  }
+
+  Future<void> stop() async {
+    if (!isSupported) return;
+    await _channel.invokeMethod('stop');
+  }
+
+  Future<bool> sendConsentRequest(LocalUserProfile profile) async {
+    if (!isSupported) {
+      onStatusChanged('Build APK/AAB and test on two Android phones.');
+      return false;
+    }
+    try {
+      final sent = await _channel.invokeMethod<bool>('sendConsentRequest', {
+        'displayName': profile.name,
+      });
+      if (sent != true) {
+        onStatusChanged('No nearby connected user yet.');
+        return false;
+      }
+      onStatusChanged('Consent request sent.');
+      return true;
+    } on PlatformException catch (error) {
+      onStatusChanged(error.message ?? 'Could not send request.');
+      return false;
+    }
+  }
+
+  Future<void> sendDecision(bool accepted) async {
+    if (!isSupported) return;
+    await _channel.invokeMethod('sendDecision', {'accepted': accepted});
+  }
+
+  Future<void> openAppPermissions() async {
+    await openAppSettings();
+  }
+
+  Future<void> openBluetoothSettings() async {
+    if (!isSupported) return;
+    await _channel.invokeMethod('openBluetoothSettings');
+  }
+
+  Future<void> openLocationSettings() async {
+    if (!isSupported) return;
+    await _channel.invokeMethod('openLocationSettings');
+  }
+
+  Future<void> openWifiSettings() async {
+    if (!isSupported) return;
+    await _channel.invokeMethod('openWifiSettings');
+  }
+
+  Future<List<NearbyPermissionRequirement>>
+  missingPermissionRequirements() async {
+    if (!isSupported) return [];
+    final requirements = await _permissionRequirements();
+    return [
+      for (final requirement in requirements)
+        if (!requirement.isGranted) requirement,
+    ];
+  }
+
+  Future<void> requestPermission(
+    NearbyPermissionRequirement requirement,
+  ) async {
+    if (requirement.needsSettings) {
+      await openAppPermissions();
+      return;
+    }
+    await requirement.permission.request();
+  }
+
+  Future<void> requestMissingPermissions() async {
+    final requirements = await missingPermissionRequirements();
+    for (final requirement in requirements) {
+      if (requirement.needsSettings) continue;
+      await requirement.permission.request();
+    }
+  }
+
+  Future<dynamic> _handleNativeEvent(MethodCall call) async {
+    final args = Map<String, dynamic>.from(call.arguments as Map? ?? {});
+    switch (call.method) {
+      case 'nearbyStatus':
+        onStatusChanged(
+          friendlyNearbyStatus(
+            args['message']?.toString() ?? 'Nearby updated.',
+          ),
+        );
+      case 'incomingConsentRequest':
+        final requesterName = args['requesterName']?.toString() ?? '';
+        if (requesterName.trim().isNotEmpty) {
+          onIncomingRequest(requesterName);
+        }
+      case 'consentDecision':
+        final accepted = args['accepted'] == true;
+        onStatusChanged(
+          accepted
+              ? 'Nearby user accepted your request.'
+              : 'Nearby user cancelled your request.',
+        );
+    }
+  }
+
+  String friendlyNearbyStatus(String message) {
+    if (message.contains('8032')) {
+      return 'Phone setup needs attention.';
+    }
+    if (message.toLowerCase().contains('permission')) {
+      return 'Allow nearby permissions to scan for users.';
+    }
+    return message;
+  }
+
+  Future<List<NearbyPermissionRequirement>> _permissionRequirements() async {
+    final sdk = await _androidSdkVersion();
+    final specs =
+        <
+          ({String id, String label, String description, Permission permission})
+        >[
+          (
+            id: 'location',
+            label: 'Location permission',
+            description: 'Required by Android to discover nearby devices.',
+            permission: Permission.location,
+          ),
+          if (sdk >= 31) ...[
+            (
+              id: 'bluetooth_scan',
+              label: 'Bluetooth scan permission',
+              description: 'Required to find nearby phones.',
+              permission: Permission.bluetoothScan,
+            ),
+            (
+              id: 'bluetooth_connect',
+              label: 'Bluetooth connect permission',
+              description: 'Required to connect to the nearby phone.',
+              permission: Permission.bluetoothConnect,
+            ),
+            (
+              id: 'bluetooth_advertise',
+              label: 'Bluetooth advertise permission',
+              description: 'Required so nearby phones can find this phone.',
+              permission: Permission.bluetoothAdvertise,
+            ),
+          ],
+          if (sdk >= 33)
+            (
+              id: 'nearby_wifi',
+              label: 'Nearby Wi-Fi permission',
+              description:
+                  'Required by newer Android versions for local device discovery.',
+              permission: Permission.nearbyWifiDevices,
+            ),
+        ];
+
+    final requirements = <NearbyPermissionRequirement>[];
+    for (final spec in specs) {
+      requirements.add(
+        NearbyPermissionRequirement(
+          id: spec.id,
+          label: spec.label,
+          description: spec.description,
+          permission: spec.permission,
+          status: await spec.permission.status,
+        ),
+      );
+    }
+    return requirements;
+  }
+
+  Future<int> _androidSdkVersion() async {
+    if (!isSupported) return 0;
+    return await _channel.invokeMethod<int>('androidSdkVersion') ?? 0;
+  }
+}
+
 class AppStorage {
+  static const _localConsentRecordsKey = 'local_consent_records';
+  static const _localDisplayNameKey = 'local_display_name';
+  static const _localUserProfileKey = 'local_user_profile';
+
   late final SharedPreferences _prefs;
 
   Future<void> init() async {
@@ -176,6 +589,14 @@ class AppStorage {
     return ThemeMode.system;
   }
 
+  String get localDisplayName {
+    final value = _prefs.getString(_localDisplayNameKey);
+    if (value == null || value.isEmpty || value == 'YOUR NAME') {
+      return 'Your name';
+    }
+    return value;
+  }
+
   Future<void> saveTokens(String access, String refresh) async {
     await _prefs.setString('access_token', access);
     await _prefs.setString('refresh_token', refresh);
@@ -188,6 +609,41 @@ class AppStorage {
 
   Future<void> saveThemeMode(ThemeMode mode) async {
     await _prefs.setString('theme_mode', mode.name);
+  }
+
+  Future<void> saveLocalDisplayName(String value) async {
+    await _prefs.setString(_localDisplayNameKey, value);
+  }
+
+  Future<LocalUserProfile?> localUserProfile() async {
+    final raw = _prefs.getString(_localUserProfileKey);
+    if (raw == null || raw.isEmpty) return null;
+    return LocalUserProfile.fromJson(
+      Map<String, dynamic>.from(jsonDecode(raw)),
+    );
+  }
+
+  Future<void> saveLocalUserProfile(LocalUserProfile profile) async {
+    await _prefs.setString(_localUserProfileKey, jsonEncode(profile.toJson()));
+  }
+
+  Future<List<LocalConsentRecord>> localConsentRecords() async {
+    final raw = _prefs.getString(_localConsentRecordsKey);
+    if (raw == null || raw.isEmpty) return [];
+    final decoded = jsonDecode(raw) as List<dynamic>;
+    return decoded
+        .map(
+          (item) =>
+              LocalConsentRecord.fromJson(Map<String, dynamic>.from(item)),
+        )
+        .toList();
+  }
+
+  Future<void> saveLocalConsentRecords(List<LocalConsentRecord> records) async {
+    await _prefs.setString(
+      _localConsentRecordsKey,
+      jsonEncode(records.map((item) => item.toJson()).toList()),
+    );
   }
 }
 
@@ -628,6 +1084,1223 @@ class _SplashScreenState extends State<SplashScreen> {
   @override
   Widget build(BuildContext context) {
     return const AppScaffold(child: Center(child: BrandMark()));
+  }
+}
+
+class LocalTouchConsentScreen extends StatefulWidget {
+  const LocalTouchConsentScreen({super.key});
+
+  @override
+  State<LocalTouchConsentScreen> createState() =>
+      _LocalTouchConsentScreenState();
+}
+
+class _LocalTouchConsentScreenState extends State<LocalTouchConsentScreen>
+    with TickerProviderStateMixin {
+  late final AnimationController holdController;
+  late final AnimationController pulseController;
+  late final NearbyConsentTransport nearbyTransport;
+  late Future<List<LocalConsentRecord>> historyFuture;
+  final profileName = TextEditingController();
+  final profileId = TextEditingController();
+  LocalUserProfile? profile;
+  String? incomingRequesterName;
+  String requestState = 'idle';
+  String nearbyStatus = 'Confirm identity to start nearby scanning.';
+  bool nearbyPermissionRequired = false;
+  bool nearbySetupIssue = false;
+  bool nearbyScanning = false;
+  List<NearbyPermissionRequirement> missingNearbyPermissions = [];
+
+  @override
+  void initState() {
+    super.initState();
+    holdController =
+        AnimationController(
+          vsync: this,
+          duration: const Duration(milliseconds: 1350),
+        )..addStatusListener((status) {
+          if (status == AnimationStatus.completed) acceptRequest();
+        });
+    pulseController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1150),
+    )..repeat(reverse: true);
+    nearbyTransport = NearbyConsentTransport(
+      onIncomingRequest: handleIncomingRequest,
+      onStatusChanged: (message) {
+        if (mounted) {
+          final lowerMessage = message.toLowerCase();
+          final setupIssue =
+              lowerMessage.contains('could not') ||
+              lowerMessage.contains('turn on') ||
+              lowerMessage.contains('setup needs') ||
+              lowerMessage.contains('phone build') ||
+              lowerMessage.contains('build apk');
+          setState(() {
+            nearbyStatus = setupIssue
+                ? 'Use the setup buttons below, then search again.'
+                : message;
+            nearbyPermissionRequired = false;
+            nearbySetupIssue = setupIssue;
+            nearbyScanning =
+                !setupIssue &&
+                (lowerMessage.contains('scanning') ||
+                    lowerMessage.contains('nearby ready') ||
+                    lowerMessage.contains('connected'));
+          });
+        }
+      },
+      onPermissionRequired: (message) {
+        if (mounted) {
+          setState(() {
+            nearbyStatus = message;
+            nearbyPermissionRequired = true;
+            nearbySetupIssue = false;
+            nearbyScanning = false;
+          });
+          refreshMissingPermissions();
+        }
+      },
+    );
+    historyFuture = sl<LocalConsentStore>().records();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      requestNearbyPermissionsOnOpen();
+    });
+    loadProfile();
+  }
+
+  Future<void> requestNearbyPermissionsOnOpen() async {
+    await nearbyTransport.requestPermissionsOnOpen();
+    final missing = await refreshMissingPermissions();
+    if (!mounted) return;
+    if (profile != null && missing.isEmpty && !nearbySetupIssue) {
+      setState(() => nearbyStatus = 'Ready to search nearby devices.');
+    }
+  }
+
+  Future<void> loadProfile() async {
+    final savedProfile = await sl<LocalConsentStore>().profile();
+    if (!mounted) return;
+    setState(() => profile = savedProfile);
+    if (savedProfile != null) {
+      await prepareNearbyPage();
+    }
+  }
+
+  @override
+  void dispose() {
+    holdController.dispose();
+    pulseController.dispose();
+    nearbyTransport.stop();
+    profileName.dispose();
+    profileId.dispose();
+    super.dispose();
+  }
+
+  void handleIncomingRequest(String requesterName) {
+    holdController.reset();
+    setState(() {
+      incomingRequesterName = cleanLocalPartyName(requesterName, 'Nearby user');
+      requestState = 'incoming';
+      nearbyStatus = 'Incoming consent request received.';
+      nearbySetupIssue = false;
+      nearbyScanning = false;
+    });
+  }
+
+  void startHold() {
+    if (requestState != 'incoming') return;
+    holdController.forward(from: holdController.value);
+  }
+
+  void stopHold() {
+    if (holdController.status == AnimationStatus.completed) return;
+    holdController.reverse();
+  }
+
+  Future<void> acceptRequest() async {
+    if (requestState == 'signed') return;
+    final confirmedProfile = profile;
+    final requesterName = incomingRequesterName;
+    if (confirmedProfile == null || requesterName == null) return;
+    await sl<LocalConsentStore>().saveDecision(
+      requesterName: requesterName,
+      holderName: confirmedProfile.name,
+      accepted: true,
+    );
+    await nearbyTransport.sendDecision(true);
+    if (!mounted) return;
+    setState(() {
+      requestState = 'signed';
+      historyFuture = sl<LocalConsentStore>().records();
+    });
+    toast('Agreement signed locally.');
+  }
+
+  Future<void> cancelRequest() async {
+    if (requestState != 'incoming') return;
+    final confirmedProfile = profile;
+    final requesterName = incomingRequesterName;
+    if (confirmedProfile == null || requesterName == null) return;
+    holdController.reset();
+    await sl<LocalConsentStore>().saveDecision(
+      requesterName: requesterName,
+      holderName: confirmedProfile.name,
+      accepted: false,
+    );
+    await nearbyTransport.sendDecision(false);
+    if (!mounted) return;
+    setState(() {
+      requestState = 'cancelled';
+      historyFuture = sl<LocalConsentStore>().records();
+    });
+    toast('Request cancelled.');
+  }
+
+  void resetIncoming() {
+    holdController.reset();
+    setState(() {
+      requestState = 'idle';
+      incomingRequesterName = null;
+    });
+  }
+
+  Future<void> confirmLocalIdentity() async {
+    final name = profileName.text.trim();
+    final idNumber = profileId.text.trim();
+    if (name.length < 2) {
+      toast('Enter your full name.');
+      return;
+    }
+    if (idNumber.length < 4) {
+      toast('Enter a valid ID number.');
+      return;
+    }
+    await sl<LocalConsentStore>().saveProfile(name: name, idNumber: idNumber);
+    final savedProfile = await sl<LocalConsentStore>().profile();
+    if (!mounted) return;
+    setState(() => profile = savedProfile);
+    if (savedProfile != null) {
+      await prepareNearbyPage();
+    }
+  }
+
+  Future<void> sendConsentRequest() async {
+    final confirmedProfile = profile;
+    if (confirmedProfile == null) return;
+    await nearbyTransport.sendConsentRequest(confirmedProfile);
+  }
+
+  Future<void> enableNearbyPermissions() async {
+    final confirmedProfile = profile;
+    setState(() {
+      nearbyStatus = 'Opening nearby permission request...';
+      nearbyPermissionRequired = false;
+      nearbySetupIssue = false;
+      nearbyScanning = false;
+    });
+    await nearbyTransport.requestPermissionsOnOpen();
+    final missing = await refreshMissingPermissions();
+    if (!mounted) return;
+    if (confirmedProfile != null && missing.isEmpty) {
+      setState(() {
+        nearbyStatus = 'Ready to search nearby devices.';
+        nearbySetupIssue = false;
+      });
+    }
+  }
+
+  Future<void> retryNearbyScan() async {
+    final confirmedProfile = profile;
+    if (confirmedProfile == null) {
+      setState(() {
+        nearbyStatus = 'Confirm identity before scanning for nearby users.';
+        nearbySetupIssue = false;
+        nearbyScanning = false;
+      });
+      return;
+    }
+    final missing = await refreshMissingPermissions();
+    if (missing.isNotEmpty) return;
+    setState(() {
+      nearbyStatus = 'Searching nearby devices...';
+      nearbyPermissionRequired = false;
+      nearbySetupIssue = false;
+      nearbyScanning = true;
+    });
+    await nearbyTransport.start(confirmedProfile, requestPermissions: false);
+    await refreshMissingPermissions();
+  }
+
+  Future<List<NearbyPermissionRequirement>> refreshMissingPermissions() async {
+    final missing = await nearbyTransport.missingPermissionRequirements();
+    if (!mounted) return missing;
+    setState(() {
+      missingNearbyPermissions = missing;
+      nearbyPermissionRequired = missing.isNotEmpty;
+      if (missing.isNotEmpty) {
+        nearbyScanning = false;
+        nearbySetupIssue = false;
+        nearbyStatus =
+            'Allow the required permissions below to scan for nearby users.';
+      }
+    });
+    return missing;
+  }
+
+  Future<void> prepareNearbyPage() async {
+    final missing = await refreshMissingPermissions();
+    if (!mounted || missing.isNotEmpty) return;
+    setState(() {
+      nearbyStatus = 'Ready to search nearby devices.';
+      nearbyPermissionRequired = false;
+      nearbySetupIssue = false;
+      nearbyScanning = false;
+    });
+  }
+
+  Future<void> requestNearbyPermission(
+    NearbyPermissionRequirement requirement,
+  ) async {
+    await nearbyTransport.requestPermission(requirement);
+    final missing = await refreshMissingPermissions();
+    if (!mounted) return;
+    if (profile != null && missing.isEmpty) {
+      setState(() {
+        nearbyStatus = 'Ready to search nearby devices.';
+        nearbyPermissionRequired = false;
+        nearbySetupIssue = false;
+        nearbyScanning = false;
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final isSigned = requestState == 'signed';
+    final isCancelled = requestState == 'cancelled';
+    final confirmedProfile = profile;
+    if (confirmedProfile == null) {
+      return _LocalIdentityConfirmationScreen(
+        name: profileName,
+        idNumber: profileId,
+        onConfirm: confirmLocalIdentity,
+        missingPermissions: missingNearbyPermissions,
+        onEnablePermissions: enableNearbyPermissions,
+        onRequestPermission: requestNearbyPermission,
+      );
+    }
+    return Scaffold(
+      body: SafeArea(
+        child: GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onHorizontalDragEnd: (details) {
+            if ((details.primaryVelocity ?? 0) < -350) cancelRequest();
+          },
+          child: Stack(
+            children: [
+              Positioned.fill(
+                child: DecoratedBox(
+                  decoration: BoxDecoration(
+                    gradient: LinearGradient(
+                      begin: Alignment.topCenter,
+                      end: Alignment.bottomCenter,
+                      colors: [
+                        scheme.surface,
+                        scheme.primary.withValues(alpha: 0.08),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+              ListView(
+                padding: const EdgeInsets.fromLTRB(20, 14, 20, 28),
+                children: [
+                  Row(
+                    children: [
+                      const BrandMark(),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Text(
+                          'Green Light Local',
+                          style: Theme.of(context).textTheme.titleLarge
+                              ?.copyWith(fontWeight: FontWeight.w800),
+                        ),
+                      ),
+                      const ThemeModeButton(),
+                    ],
+                  ),
+                  const SizedBox(height: 24),
+                  _ConfirmedProfileHeader(profile: confirmedProfile),
+                  const SizedBox(height: 34),
+                  if (requestState == 'idle') ...[
+                    _WaitingNearbyPanel(
+                      status: nearbyStatus,
+                      permissionRequired: nearbyPermissionRequired,
+                      setupIssue: nearbySetupIssue,
+                      missingPermissions: missingNearbyPermissions,
+                      scanning: nearbyScanning,
+                      onEnablePermissions: enableNearbyPermissions,
+                      onRequestPermission: requestNearbyPermission,
+                      onSearch: retryNearbyScan,
+                      onOpenAppSettings: nearbyTransport.openAppPermissions,
+                      onSendRequest: sendConsentRequest,
+                    ),
+                  ] else ...[
+                    _IncomingRequestPill(
+                      requester: incomingRequesterName ?? '',
+                      pulse: pulseController,
+                      state: requestState,
+                    ),
+                    const SizedBox(height: 22),
+                    _TouchConsentPad(
+                      holdController: holdController,
+                      pulseController: pulseController,
+                      enabled: requestState == 'incoming',
+                      isSigned: isSigned,
+                      isCancelled: isCancelled,
+                      onPointerDown: startHold,
+                      onPointerUp: stopHold,
+                    ),
+                    const SizedBox(height: 26),
+                    _LocalPartiesPanel(
+                      requesterName: incomingRequesterName ?? '',
+                      holderName: confirmedProfile.name,
+                    ),
+                  ],
+                  if (requestState != 'idle') ...[
+                    const SizedBox(height: 18),
+                    _LocalActionStrip(
+                      state: requestState,
+                      onReset: resetIncoming,
+                      onCancel: cancelRequest,
+                    ),
+                  ],
+                  const SizedBox(height: 18),
+                  _LocalHistoryPanel(historyFuture: historyFuture),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _IncomingRequestPill extends StatelessWidget {
+  const _IncomingRequestPill({
+    required this.requester,
+    required this.pulse,
+    required this.state,
+  });
+
+  final String requester;
+  final Animation<double> pulse;
+  final String state;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final requesterName = requester.trim().isEmpty
+        ? 'User 1'
+        : requester.trim();
+    final title = state == 'incoming'
+        ? 'Incoming consent request'
+        : state == 'signed'
+        ? 'Agreement signed'
+        : 'Request cancelled';
+    final subtitle = state == 'incoming'
+        ? 'From $requesterName'
+        : state == 'signed'
+        ? 'Stored locally on this phone'
+        : 'No agreement was created';
+    return AnimatedBuilder(
+      animation: pulse,
+      builder: (context, child) {
+        final scale = state == 'incoming' ? 1 + (pulse.value * 0.08) : 1.0;
+        return Transform.scale(scale: scale, child: child);
+      },
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 16),
+        decoration: BoxDecoration(
+          color: scheme.primaryContainer,
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: scheme.primary.withValues(alpha: 0.45)),
+          boxShadow: [
+            BoxShadow(
+              color: scheme.primary.withValues(alpha: 0.18),
+              blurRadius: 24,
+              offset: const Offset(0, 10),
+            ),
+          ],
+        ),
+        child: Row(
+          children: [
+            Icon(
+              state == 'incoming'
+                  ? Icons.sensors_rounded
+                  : state == 'signed'
+                  ? Icons.verified_rounded
+                  : Icons.cancel_rounded,
+              color: scheme.primary,
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.center,
+                children: [
+                  Text(
+                    title,
+                    textAlign: TextAlign.center,
+                    style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                      fontWeight: FontWeight.w900,
+                      letterSpacing: 0,
+                      color: scheme.onPrimaryContainer,
+                    ),
+                  ),
+                  const SizedBox(height: 3),
+                  Text(
+                    subtitle,
+                    textAlign: TextAlign.center,
+                    style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                      color: scheme.onPrimaryContainer.withValues(alpha: 0.78),
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _LocalIdentityConfirmationScreen extends StatelessWidget {
+  const _LocalIdentityConfirmationScreen({
+    required this.name,
+    required this.idNumber,
+    required this.onConfirm,
+    required this.missingPermissions,
+    required this.onEnablePermissions,
+    required this.onRequestPermission,
+  });
+
+  final TextEditingController name;
+  final TextEditingController idNumber;
+  final VoidCallback onConfirm;
+  final List<NearbyPermissionRequirement> missingPermissions;
+  final VoidCallback onEnablePermissions;
+  final ValueChanged<NearbyPermissionRequirement> onRequestPermission;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Scaffold(
+      body: SafeArea(
+        child: Center(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.all(22),
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 460),
+              child: SectionCard(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const BrandMark(),
+                    const SizedBox(height: 18),
+                    Text(
+                      'Confirm identity',
+                      textAlign: TextAlign.center,
+                      style: Theme.of(context).textTheme.headlineSmall
+                          ?.copyWith(fontWeight: FontWeight.w800),
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      'Your confirmed name is used for local agreements.',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(color: scheme.onSurfaceVariant),
+                    ),
+                    const SizedBox(height: 22),
+                    TextField(
+                      controller: name,
+                      textCapitalization: TextCapitalization.words,
+                      decoration: const InputDecoration(
+                        labelText: 'Full name',
+                        prefixIcon: Icon(Icons.person_rounded),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    TextField(
+                      controller: idNumber,
+                      textCapitalization: TextCapitalization.characters,
+                      decoration: const InputDecoration(
+                        labelText: 'Government ID number',
+                        prefixIcon: Icon(Icons.badge_rounded),
+                      ),
+                    ),
+                    const SizedBox(height: 18),
+                    FilledButton.icon(
+                      onPressed: onConfirm,
+                      icon: const Icon(Icons.verified_user_rounded),
+                      label: const Text('Confirm identity'),
+                    ),
+                    if (missingPermissions.isNotEmpty) ...[
+                      const SizedBox(height: 18),
+                      const Divider(),
+                      const SizedBox(height: 10),
+                      Text(
+                        'Nearby permissions required',
+                        style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                          fontWeight: FontWeight.w800,
+                        ),
+                      ),
+                      const SizedBox(height: 10),
+                      for (final requirement in missingPermissions) ...[
+                        _PermissionActionTile(
+                          requirement: requirement,
+                          onPressed: () => onRequestPermission(requirement),
+                        ),
+                        const SizedBox(height: 10),
+                      ],
+                      OutlinedButton.icon(
+                        onPressed: onEnablePermissions,
+                        icon: const Icon(Icons.lock_open_rounded),
+                        label: const Text('Allow all missing permissions'),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _ConfirmedProfileHeader extends StatelessWidget {
+  const _ConfirmedProfileHeader({required this.profile});
+
+  final LocalUserProfile profile;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: scheme.surfaceContainerHighest.withValues(alpha: 0.55),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: scheme.outlineVariant),
+      ),
+      child: Row(
+        children: [
+          Icon(Icons.verified_rounded, color: scheme.primary),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  profile.name,
+                  style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+                Text(
+                  'Confirmed ID ${profile.maskedId}',
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: scheme.onSurfaceVariant,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _WaitingNearbyPanel extends StatelessWidget {
+  const _WaitingNearbyPanel({
+    required this.status,
+    required this.permissionRequired,
+    required this.setupIssue,
+    required this.missingPermissions,
+    required this.scanning,
+    required this.onEnablePermissions,
+    required this.onRequestPermission,
+    required this.onSearch,
+    required this.onOpenAppSettings,
+    required this.onSendRequest,
+  });
+
+  final String status;
+  final bool permissionRequired;
+  final bool setupIssue;
+  final List<NearbyPermissionRequirement> missingPermissions;
+  final bool scanning;
+  final VoidCallback onEnablePermissions;
+  final ValueChanged<NearbyPermissionRequirement> onRequestPermission;
+  final VoidCallback onSearch;
+  final VoidCallback onOpenAppSettings;
+  final VoidCallback onSendRequest;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final hasIssue = permissionRequired || setupIssue;
+    final title = permissionRequired
+        ? 'Nearby permissions needed'
+        : setupIssue
+        ? 'Phone setup needed'
+        : scanning
+        ? 'Searching nearby devices'
+        : 'Ready to search';
+    final description = permissionRequired
+        ? 'Allow the exact permissions below before scanning.'
+        : setupIssue
+        ? 'Turn on the required phone settings, then tap search again.'
+        : scanning
+        ? 'Keep both phones unlocked with Green Light open.'
+        : 'Tap the green button when the nearby phone is open.';
+    return SectionCard(
+      child: Column(
+        children: [
+          Icon(
+            hasIssue ? Icons.nearby_error_rounded : Icons.sensors_rounded,
+            color: hasIssue ? scheme.error : scheme.primary,
+            size: 44,
+          ),
+          const SizedBox(height: 12),
+          Text(
+            title,
+            textAlign: TextAlign.center,
+            style: Theme.of(
+              context,
+            ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w800),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            description,
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              color: hasIssue ? scheme.error : scheme.onSurfaceVariant,
+              height: 1.35,
+            ),
+          ),
+          if (!hasIssue && status.isNotEmpty) ...[
+            const SizedBox(height: 6),
+            Text(
+              status,
+              textAlign: TextAlign.center,
+              style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                color: scheme.onSurfaceVariant,
+                height: 1.3,
+              ),
+            ),
+          ],
+          const SizedBox(height: 14),
+          if (permissionRequired) ...[
+            for (final requirement in missingPermissions) ...[
+              _PermissionActionTile(
+                requirement: requirement,
+                onPressed: () => onRequestPermission(requirement),
+              ),
+              const SizedBox(height: 10),
+            ],
+            FilledButton.icon(
+              onPressed: onEnablePermissions,
+              icon: const Icon(Icons.lock_open_rounded),
+              label: const Text('Allow all missing permissions'),
+            ),
+            const SizedBox(height: 10),
+            OutlinedButton.icon(
+              onPressed: onOpenAppSettings,
+              icon: const Icon(Icons.settings_rounded),
+              label: const Text('Open app permissions'),
+            ),
+          ] else if (scanning) ...[
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(8),
+                color: scheme.primary.withValues(alpha: 0.08),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  SizedBox(
+                    width: 16,
+                    height: 16,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 2,
+                      color: scheme.primary,
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  const Text('Scanning nearby devices'),
+                ],
+              ),
+            ),
+            const SizedBox(height: 12),
+            FilledButton.icon(
+              onPressed: onSendRequest,
+              icon: const Icon(Icons.send_rounded),
+              label: const Text('Start request with nearby user'),
+            ),
+          ] else ...[
+            _RoundNearbySearchButton(onPressed: onSearch),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _RoundNearbySearchButton extends StatelessWidget {
+  const _RoundNearbySearchButton({required this.onPressed});
+
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Column(
+      children: [
+        Tooltip(
+          message: 'Search nearby device',
+          child: Material(
+            color: scheme.primary,
+            shape: const CircleBorder(),
+            elevation: 6,
+            shadowColor: scheme.primary.withValues(alpha: 0.35),
+            child: InkWell(
+              customBorder: const CircleBorder(),
+              onTap: onPressed,
+              child: SizedBox(
+                width: 92,
+                height: 92,
+                child: Icon(
+                  Icons.sensors_rounded,
+                  size: 42,
+                  color: scheme.onPrimary,
+                ),
+              ),
+            ),
+          ),
+        ),
+        const SizedBox(height: 10),
+        Text(
+          'Search nearby device',
+          style: Theme.of(
+            context,
+          ).textTheme.labelLarge?.copyWith(fontWeight: FontWeight.w800),
+        ),
+      ],
+    );
+  }
+}
+
+class _PermissionActionTile extends StatelessWidget {
+  const _PermissionActionTile({
+    required this.requirement,
+    required this.onPressed,
+  });
+
+  final NearbyPermissionRequirement requirement;
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: scheme.errorContainer.withValues(alpha: 0.35),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: scheme.error.withValues(alpha: 0.28)),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(_permissionIcon(requirement.id), color: scheme.error),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  requirement.label,
+                  style: Theme.of(
+                    context,
+                  ).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w800),
+                ),
+                const SizedBox(height: 3),
+                Text(
+                  requirement.description,
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: scheme.onSurfaceVariant,
+                    height: 1.3,
+                  ),
+                ),
+                const SizedBox(height: 10),
+                Align(
+                  alignment: Alignment.centerLeft,
+                  child: OutlinedButton.icon(
+                    onPressed: onPressed,
+                    icon: Icon(
+                      requirement.needsSettings
+                          ? Icons.settings_rounded
+                          : Icons.lock_open_rounded,
+                    ),
+                    label: Text(
+                      requirement.needsSettings
+                          ? 'Open app settings'
+                          : 'Allow ${requirement.label}',
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  IconData _permissionIcon(String id) {
+    if (id.startsWith('bluetooth')) return Icons.bluetooth_rounded;
+    if (id == 'location') return Icons.location_on_rounded;
+    if (id == 'nearby_wifi') return Icons.wifi_rounded;
+    return Icons.lock_open_rounded;
+  }
+}
+
+class _TouchConsentPad extends StatelessWidget {
+  const _TouchConsentPad({
+    required this.holdController,
+    required this.pulseController,
+    required this.enabled,
+    required this.isSigned,
+    required this.isCancelled,
+    required this.onPointerDown,
+    required this.onPointerUp,
+  });
+
+  final Animation<double> holdController;
+  final Animation<double> pulseController;
+  final bool enabled;
+  final bool isSigned;
+  final bool isCancelled;
+  final VoidCallback onPointerDown;
+  final VoidCallback onPointerUp;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return AspectRatio(
+      aspectRatio: 0.82,
+      child: Container(
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(36),
+          border: Border.all(color: scheme.outlineVariant, width: 2),
+          color: Theme.of(context).cardTheme.color,
+        ),
+        child: Stack(
+          alignment: Alignment.center,
+          children: [
+            AnimatedBuilder(
+              animation: pulseController,
+              builder: (context, _) {
+                return Stack(
+                  alignment: Alignment.center,
+                  children: [
+                    _PulseRing(
+                      size: 220 + pulseController.value * 46,
+                      opacity: enabled ? 0.18 : 0.06,
+                    ),
+                    _PulseRing(
+                      size: 160 + pulseController.value * 34,
+                      opacity: enabled ? 0.24 : 0.08,
+                    ),
+                  ],
+                );
+              },
+            ),
+            Listener(
+              onPointerDown: (_) => onPointerDown(),
+              onPointerUp: (_) => onPointerUp(),
+              onPointerCancel: (_) => onPointerUp(),
+              child: AnimatedBuilder(
+                animation: holdController,
+                builder: (context, _) {
+                  final buttonColor = isCancelled
+                      ? scheme.error
+                      : isSigned
+                      ? const Color(0xFF1976D2)
+                      : scheme.primary;
+                  return SizedBox(
+                    width: 156,
+                    height: 156,
+                    child: Stack(
+                      alignment: Alignment.center,
+                      children: [
+                        SizedBox(
+                          width: 156,
+                          height: 156,
+                          child: CircularProgressIndicator(
+                            value: holdController.value,
+                            strokeWidth: 8,
+                            backgroundColor: scheme.surfaceContainerHighest,
+                          ),
+                        ),
+                        AnimatedContainer(
+                          duration: const Duration(milliseconds: 220),
+                          width: 126,
+                          height: 126,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            color: buttonColor,
+                            boxShadow: [
+                              BoxShadow(
+                                color: buttonColor.withValues(alpha: 0.32),
+                                blurRadius: 30,
+                                offset: const Offset(0, 14),
+                              ),
+                            ],
+                          ),
+                          child: Icon(
+                            isCancelled
+                                ? Icons.close_rounded
+                                : isSigned
+                                ? Icons.check_rounded
+                                : Icons.touch_app_rounded,
+                            color: Colors.white,
+                            size: 48,
+                          ),
+                        ),
+                      ],
+                    ),
+                  );
+                },
+              ),
+            ),
+            Positioned(
+              bottom: 24,
+              left: 24,
+              right: 24,
+              child: Text(
+                enabled
+                    ? 'Press and hold to accept · Swipe left to cancel'
+                    : isSigned
+                    ? 'Agreement is signed and stored on this phone'
+                    : 'Request cancelled on this phone',
+                textAlign: TextAlign.center,
+                style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                  color: scheme.onSurfaceVariant,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _PulseRing extends StatelessWidget {
+  const _PulseRing({required this.size, required this.opacity});
+
+  final double size;
+  final double opacity;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Container(
+      width: size,
+      height: size,
+      decoration: BoxDecoration(
+        shape: BoxShape.circle,
+        border: Border.all(
+          color: scheme.primary.withValues(alpha: opacity),
+          width: 2,
+        ),
+      ),
+    );
+  }
+}
+
+class _LocalPartiesPanel extends StatelessWidget {
+  const _LocalPartiesPanel({
+    required this.requesterName,
+    required this.holderName,
+  });
+
+  final String requesterName;
+  final String holderName;
+
+  @override
+  Widget build(BuildContext context) {
+    return SectionCard(
+      child: Column(
+        children: [
+          _ReadOnlyPartyRow(
+            icon: Icons.person_add_alt_1_rounded,
+            label: 'Request from',
+            value: requesterName,
+          ),
+          const SizedBox(height: 12),
+          _ReadOnlyPartyRow(
+            icon: Icons.badge_rounded,
+            label: 'Your name',
+            value: holderName,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ReadOnlyPartyRow extends StatelessWidget {
+  const _ReadOnlyPartyRow({
+    required this.icon,
+    required this.label,
+    required this.value,
+  });
+
+  final IconData icon;
+  final String label;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+      decoration: BoxDecoration(
+        color: scheme.surfaceContainerHighest.withValues(alpha: 0.35),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: scheme.outlineVariant),
+      ),
+      child: Row(
+        children: [
+          Icon(icon, color: scheme.primary),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  label,
+                  style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                    color: scheme.onSurfaceVariant,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  value,
+                  style: Theme.of(
+                    context,
+                  ).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w800),
+                ),
+              ],
+            ),
+          ),
+          Icon(Icons.lock_rounded, size: 18, color: scheme.onSurfaceVariant),
+        ],
+      ),
+    );
+  }
+}
+
+class _LocalActionStrip extends StatelessWidget {
+  const _LocalActionStrip({
+    required this.state,
+    required this.onReset,
+    required this.onCancel,
+  });
+
+  final String state;
+  final VoidCallback onReset;
+  final VoidCallback onCancel;
+
+  @override
+  Widget build(BuildContext context) {
+    if (state == 'incoming') {
+      return OutlinedButton.icon(
+        onPressed: onCancel,
+        icon: const Icon(Icons.swipe_left_rounded),
+        label: const Text('Swipe left or tap to cancel'),
+      );
+    }
+    return FilledButton.icon(
+      onPressed: onReset,
+      icon: const Icon(Icons.restart_alt_rounded),
+      label: const Text('New local request'),
+    );
+  }
+}
+
+class _LocalHistoryPanel extends StatelessWidget {
+  const _LocalHistoryPanel({required this.historyFuture});
+
+  final Future<List<LocalConsentRecord>> historyFuture;
+
+  @override
+  Widget build(BuildContext context) {
+    return FutureBuilder<List<LocalConsentRecord>>(
+      future: historyFuture,
+      builder: (context, snapshot) {
+        final records = snapshot.data ?? [];
+        return SectionCard(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'Local trail',
+                style: Theme.of(
+                  context,
+                ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w800),
+              ),
+              const SizedBox(height: 8),
+              if (snapshot.connectionState != ConnectionState.done)
+                const LinearProgressIndicator()
+              else if (records.isEmpty)
+                const Text('No local agreements yet.')
+              else
+                for (final record in records.take(5))
+                  ListTile(
+                    contentPadding: EdgeInsets.zero,
+                    leading: Icon(
+                      record.status == 'signed'
+                          ? Icons.verified_rounded
+                          : Icons.cancel_rounded,
+                    ),
+                    title: Text(
+                      '${cleanLocalPartyName(record.requesterName, 'Nearby user')} -> '
+                      '${cleanLocalPartyName(record.holderName, 'Confirmed user')}',
+                    ),
+                    subtitle: Text(
+                      '${record.status.toUpperCase()} · ${DateFormat.MMMd().add_jm().format(record.createdAt)}',
+                    ),
+                  ),
+            ],
+          ),
+        );
+      },
+    );
   }
 }
 
@@ -1249,17 +2922,18 @@ class _AgreementDetailScreenState extends State<AgreementDetailScreen> {
     }
   }
 
-  Future<void> renew() async {
+  int renewalDurationHours(Agreement agreement) {
+    const allowedDurations = {24, 168, 720};
+    return allowedDurations.contains(agreement.durationHours)
+        ? agreement.durationHours
+        : 24;
+  }
+
+  Future<void> renew(Agreement agreement) async {
     try {
-      final nextExpiration = await pickAgreementExpirationDate(
-        context,
-        DateTime.now().add(Duration(hours: 24)),
-      );
-      if (nextExpiration == null) return;
       final renewed = await sl<ConsentRepository>().renew(
         widget.agreementId,
-        null,
-        requestedExpiresAt: nextExpiration,
+        renewalDurationHours(agreement),
       );
       if (mounted) context.go('/agreements/${renewed.id}');
     } catch (error) {
@@ -1374,7 +3048,7 @@ class _AgreementDetailScreenState extends State<AgreementDetailScreen> {
                   const SizedBox(width: 10),
                   Expanded(
                     child: FilledButton.icon(
-                      onPressed: canRenew ? renew : null,
+                      onPressed: canRenew ? () => renew(agreement) : null,
                       icon: const Icon(Icons.autorenew_rounded),
                       label: const Text('Renew'),
                     ),
