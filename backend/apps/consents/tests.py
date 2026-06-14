@@ -9,7 +9,7 @@ from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APITestCase
 
-from .models import ConsentAgreement
+from .models import AuditLog, ConsentAgreement
 
 User = get_user_model()
 
@@ -128,3 +128,30 @@ class ConsentSignatureTests(APITestCase):
         self.agreement.refresh_from_db()
         self.assertEqual(self.agreement.status, ConsentAgreement.Status.PENDING_SIGNATURES)
         self.assertIsNotNone(self.agreement.requested_expires_at)
+
+    def test_viewing_agreement_is_not_shown_in_activity_history(self):
+        self.client.force_authenticate(self.creator)
+        AuditLog.objects.create(
+            actor=self.creator,
+            agreement=self.agreement,
+            action="agreement_viewed",
+        )
+        AuditLog.objects.create(
+            actor=self.creator,
+            agreement=self.agreement,
+            action="agreement_created",
+        )
+
+        detail_response = self.client.get(f"/api/consents/agreements/{self.agreement.id}/")
+        self.assertEqual(detail_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            AuditLog.objects.filter(agreement=self.agreement, action="agreement_viewed").count(),
+            1,
+        )
+
+        audit_response = self.client.get(f"/api/consents/agreements/{self.agreement.id}/audit/")
+        self.assertEqual(audit_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            [entry["action"] for entry in audit_response.data],
+            ["agreement_created"],
+        )

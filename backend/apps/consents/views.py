@@ -87,7 +87,7 @@ def build_contract_pdf(agreement):
     if not agreement.signatures.exists():
         lines.append("No signatures have been recorded yet.")
     lines.extend(["", "ACTIVITY HISTORY"])
-    for log in agreement.audit_logs.select_related("actor").all():
+    for log in agreement.audit_logs.exclude(action="agreement_viewed").select_related("actor"):
         actor = log.actor.phone_number if log.actor else "System"
         lines.append(f"{log.created_at:%Y-%m-%d %H:%M UTC} - {log.action.replace('_', ' ').title()} - {actor}")
 
@@ -169,7 +169,6 @@ class ConsentAgreementDetailView(generics.RetrieveAPIView):
     def retrieve(self, request, *args, **kwargs):
         instance = self.get_object()
         instance.mark_expired_if_needed()
-        write_audit(request, "agreement_viewed", instance)
         return Response(self.get_serializer(instance).data)
 
 
@@ -247,7 +246,7 @@ class AgreementAuditTrailView(generics.ListAPIView):
 
     def get_queryset(self):
         agreement = get_object_or_404(agreement_queryset_for(self.request.user), pk=self.kwargs["pk"])
-        return agreement.audit_logs.select_related("actor")
+        return agreement.audit_logs.exclude(action="agreement_viewed").select_related("actor")
 
 
 class AgreementPDFDownloadView(APIView):

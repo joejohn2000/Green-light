@@ -40,6 +40,15 @@ class GreenLightApp extends StatelessWidget {
     final router = GoRouter(
       refreshListenable: session,
       initialLocation: '/',
+      redirect: (context, state) {
+        final loggedIn = session.isLoggedIn;
+        final publicPath =
+            state.matchedLocation == '/login' ||
+            state.matchedLocation == '/register';
+        if (!loggedIn && !publicPath) return '/login';
+        if (loggedIn && publicPath) return '/';
+        return null;
+      },
       routes: [
         GoRoute(path: '/', builder: (_, __) => const LocalTouchConsentScreen()),
         GoRoute(path: '/login', builder: (_, __) => const LoginScreen()),
@@ -326,11 +335,31 @@ class NearbyPermissionRequirement {
   bool get needsSettings => status.isPermanentlyDenied || status.isRestricted;
 }
 
+class NearbyPhoneSettingRequirement {
+  const NearbyPhoneSettingRequirement({
+    required this.id,
+    required this.label,
+    required this.description,
+    required this.icon,
+    required this.openSettings,
+  });
+
+  final String id;
+  final String label;
+  final String description;
+  final IconData icon;
+  final Future<void> Function() openSettings;
+}
+
 class NearbyConsentTransport {
   NearbyConsentTransport({
     required this.onIncomingRequest,
     required this.onStatusChanged,
     required this.onPermissionRequired,
+    required this.onDeviceFound,
+    required this.onDeviceLost,
+    required this.onDeviceConnected,
+    required this.onSignatureState,
   });
 
   static const _channel = MethodChannel('green_light/nearby');
@@ -338,6 +367,10 @@ class NearbyConsentTransport {
   final ValueChanged<String> onIncomingRequest;
   final ValueChanged<String> onStatusChanged;
   final ValueChanged<String> onPermissionRequired;
+  final void Function(String endpointId, String endpointName) onDeviceFound;
+  final void Function(String endpointId, String endpointName) onDeviceLost;
+  final void Function(String endpointId, String endpointName) onDeviceConnected;
+  final void Function(String state, String signerName) onSignatureState;
 
   bool get isSupported =>
       !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
@@ -399,7 +432,10 @@ class NearbyConsentTransport {
     await _channel.invokeMethod('stop');
   }
 
-  Future<bool> sendConsentRequest(LocalUserProfile profile) async {
+  Future<bool> sendConsentRequest(
+    LocalUserProfile profile, {
+    String? agreementId,
+  }) async {
     if (!isSupported) {
       onStatusChanged('Build APK/AAB and test on two Android phones.');
       return false;
@@ -407,6 +443,7 @@ class NearbyConsentTransport {
     try {
       final sent = await _channel.invokeMethod<bool>('sendConsentRequest', {
         'displayName': profile.name,
+        'agreementId': agreementId ?? '',
       });
       if (sent != true) {
         onStatusChanged('No nearby connected user yet.');
@@ -423,6 +460,18 @@ class NearbyConsentTransport {
   Future<void> sendDecision(bool accepted) async {
     if (!isSupported) return;
     await _channel.invokeMethod('sendDecision', {'accepted': accepted});
+  }
+
+  Future<bool> sendSignatureState(
+    String state, {
+    required String signerName,
+  }) async {
+    if (!isSupported) return false;
+    return await _channel.invokeMethod<bool>('sendSignatureState', {
+          'state': state,
+          'signerName': signerName,
+        }) ??
+        false;
   }
 
   Future<void> openAppPermissions() async {
@@ -442,6 +491,33 @@ class NearbyConsentTransport {
   Future<void> openWifiSettings() async {
     if (!isSupported) return;
     await _channel.invokeMethod('openWifiSettings');
+  }
+
+  Future<List<NearbyPhoneSettingRequirement>>
+  missingPhoneSettingRequirements() async {
+    if (!isSupported) return [];
+    final status = Map<String, dynamic>.from(
+      await _channel.invokeMethod<Map>('phoneSettingsStatus') ?? {},
+    );
+    return [
+      if (status['bluetoothEnabled'] != true)
+        NearbyPhoneSettingRequirement(
+          id: 'bluetooth',
+          label: 'Turn on Bluetooth',
+          description: 'Required to discover and connect nearby phones.',
+          icon: Icons.bluetooth_rounded,
+          openSettings: openBluetoothSettings,
+        ),
+      if (status['locationEnabled'] != true)
+        NearbyPhoneSettingRequirement(
+          id: 'location_service',
+          label: 'Turn on Location',
+          description:
+              'Android requires Location service for nearby discovery.',
+          icon: Icons.location_on_rounded,
+          openSettings: openLocationSettings,
+        ),
+    ];
   }
 
   Future<List<NearbyPermissionRequirement>>
@@ -483,8 +559,9 @@ class NearbyConsentTransport {
         );
       case 'incomingConsentRequest':
         final requesterName = args['requesterName']?.toString() ?? '';
+        final agreementId = args['agreementId']?.toString() ?? '';
         if (requesterName.trim().isNotEmpty) {
-          onIncomingRequest(requesterName);
+          onIncomingRequest('$requesterName|$agreementId');
         }
       case 'consentDecision':
         final accepted = args['accepted'] == true;
@@ -492,6 +569,26 @@ class NearbyConsentTransport {
           accepted
               ? 'Nearby user accepted your request.'
               : 'Nearby user cancelled your request.',
+        );
+      case 'nearbyDeviceFound':
+        onDeviceFound(
+          args['endpointId']?.toString() ?? '',
+          args['endpointName']?.toString() ?? 'Nearby user',
+        );
+      case 'nearbyDeviceLost':
+        onDeviceLost(
+          args['endpointId']?.toString() ?? '',
+          args['endpointName']?.toString() ?? 'Nearby user',
+        );
+      case 'nearbyDeviceConnected':
+        onDeviceConnected(
+          args['endpointId']?.toString() ?? '',
+          args['endpointName']?.toString() ?? 'Nearby user',
+        );
+      case 'signatureState':
+        onSignatureState(
+          args['state']?.toString() ?? '',
+          args['signerName']?.toString() ?? 'Nearby user',
         );
     }
   }
@@ -1096,7 +1193,7 @@ class LocalTouchConsentScreen extends StatefulWidget {
 }
 
 class _LocalTouchConsentScreenState extends State<LocalTouchConsentScreen>
-    with TickerProviderStateMixin {
+    with TickerProviderStateMixin, WidgetsBindingObserver {
   late final AnimationController holdController;
   late final AnimationController pulseController;
   late final NearbyConsentTransport nearbyTransport;
@@ -1111,17 +1208,24 @@ class _LocalTouchConsentScreenState extends State<LocalTouchConsentScreen>
   bool nearbySetupIssue = false;
   bool nearbyScanning = false;
   List<NearbyPermissionRequirement> missingNearbyPermissions = [];
+  List<NearbyPhoneSettingRequirement> missingNearbySettings = [];
+  final Map<String, String> nearbyDevices = {};
+  final Set<String> connectedNearbyDevices = {};
+  bool _isLoggedIn = false;
+  bool localSignatureComplete = false;
+  bool remoteSignatureComplete = false;
+  bool remoteHoldingSignature = false;
+  bool mutualAgreementSaved = false;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     holdController =
-        AnimationController(
-          vsync: this,
-          duration: const Duration(milliseconds: 1350),
-        )..addStatusListener((status) {
-          if (status == AnimationStatus.completed) acceptRequest();
-        });
+        AnimationController(vsync: this, duration: const Duration(seconds: 5))
+          ..addStatusListener((status) {
+            if (status == AnimationStatus.completed) completeLocalSignature();
+          });
     pulseController = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 1150),
@@ -1131,15 +1235,10 @@ class _LocalTouchConsentScreenState extends State<LocalTouchConsentScreen>
       onStatusChanged: (message) {
         if (mounted) {
           final lowerMessage = message.toLowerCase();
-          final setupIssue =
-              lowerMessage.contains('could not') ||
-              lowerMessage.contains('turn on') ||
-              lowerMessage.contains('setup needs') ||
-              lowerMessage.contains('phone build') ||
-              lowerMessage.contains('build apk');
+          final setupIssue = message.startsWith('SETUP_ISSUE:');
           setState(() {
             nearbyStatus = setupIssue
-                ? 'Use the setup buttons below, then search again.'
+                ? 'Check the required items below, then search again.'
                 : message;
             nearbyPermissionRequired = false;
             nearbySetupIssue = setupIssue;
@@ -1149,6 +1248,9 @@ class _LocalTouchConsentScreenState extends State<LocalTouchConsentScreen>
                     lowerMessage.contains('nearby ready') ||
                     lowerMessage.contains('connected'));
           });
+          if (setupIssue) {
+            refreshNearbyReadiness();
+          }
         }
       },
       onPermissionRequired: (message) {
@@ -1159,22 +1261,60 @@ class _LocalTouchConsentScreenState extends State<LocalTouchConsentScreen>
             nearbySetupIssue = false;
             nearbyScanning = false;
           });
-          refreshMissingPermissions();
+          refreshNearbyReadiness();
         }
       },
+      onDeviceFound: (endpointId, endpointName) {
+        if (!mounted || endpointId.isEmpty) return;
+        setState(() {
+          nearbyDevices[endpointId] = endpointName;
+          nearbyStatus = 'Found nearby user $endpointName';
+        });
+      },
+      onDeviceLost: (endpointId, endpointName) {
+        if (!mounted || endpointId.isEmpty) return;
+        setState(() {
+          nearbyDevices.remove(endpointId);
+          connectedNearbyDevices.remove(endpointId);
+          if (connectedNearbyDevices.isEmpty &&
+              requestState == 'incoming' &&
+              !mutualAgreementSaved) {
+            resetMutualSigningSession();
+            requestState = 'idle';
+          }
+          nearbyStatus = nearbyDevices.isEmpty
+              ? 'Nearby user moved away'
+              : 'Looking for nearby users';
+        });
+      },
+      onDeviceConnected: (endpointId, endpointName) {
+        if (!mounted || endpointId.isEmpty) return;
+        setState(() {
+          nearbyDevices[endpointId] = endpointName;
+          connectedNearbyDevices.add(endpointId);
+          nearbyStatus = 'Connected to $endpointName';
+          nearbyScanning = false;
+          beginMutualSigningSession(endpointName);
+        });
+      },
+      onSignatureState: handleSignatureState,
     );
     historyFuture = sl<LocalConsentStore>().records();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       requestNearbyPermissionsOnOpen();
     });
     loadProfile();
+    _isLoggedIn = sl<AppSession>().isLoggedIn;
   }
 
   Future<void> requestNearbyPermissionsOnOpen() async {
     await nearbyTransport.requestPermissionsOnOpen();
-    final missing = await refreshMissingPermissions();
+    final missing = await refreshNearbyReadiness();
     if (!mounted) return;
-    if (profile != null && missing.isEmpty && !nearbySetupIssue) {
+    if (profile != null &&
+        missing.permissions.isEmpty &&
+        missing.settings.isEmpty &&
+        !nearbySetupIssue) {
       setState(() => nearbyStatus = 'Ready to search nearby devices.');
     }
   }
@@ -1190,6 +1330,7 @@ class _LocalTouchConsentScreenState extends State<LocalTouchConsentScreen>
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     holdController.dispose();
     pulseController.dispose();
     nearbyTransport.stop();
@@ -1198,44 +1339,148 @@ class _LocalTouchConsentScreenState extends State<LocalTouchConsentScreen>
     super.dispose();
   }
 
-  void handleIncomingRequest(String requesterName) {
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed && profile != null) {
+      prepareNearbyPage();
+    }
+  }
+
+  void handleIncomingRequest(String payload) {
     holdController.reset();
+    final parts = payload.split('|');
+    final requesterName = parts[0];
     setState(() {
       incomingRequesterName = cleanLocalPartyName(requesterName, 'Nearby user');
       requestState = 'incoming';
       nearbyStatus = 'Incoming consent request received.';
       nearbySetupIssue = false;
       nearbyScanning = false;
+      nearbyDevices.clear();
+      connectedNearbyDevices.clear();
     });
   }
 
-  void startHold() {
+  void beginMutualSigningSession(String peerName) {
+    holdController.reset();
+    incomingRequesterName = cleanLocalPartyName(peerName, 'Nearby user');
+    requestState = 'incoming';
+    localSignatureComplete = false;
+    remoteSignatureComplete = false;
+    remoteHoldingSignature = false;
+    mutualAgreementSaved = false;
+  }
+
+  void resetMutualSigningSession() {
+    holdController.reset();
+    localSignatureComplete = false;
+    remoteSignatureComplete = false;
+    remoteHoldingSignature = false;
+    mutualAgreementSaved = false;
+  }
+
+  Future<void> startHold() async {
     if (requestState != 'incoming') return;
+    if (localSignatureComplete || mutualAgreementSaved) return;
+    final confirmedProfile = profile;
+    if (confirmedProfile == null) return;
+    await nearbyTransport.sendSignatureState(
+      'holding',
+      signerName: confirmedProfile.name,
+    );
     holdController.forward(from: holdController.value);
   }
 
-  void stopHold() {
+  Future<void> stopHold() async {
     if (holdController.status == AnimationStatus.completed) return;
-    holdController.reverse();
+    if (!localSignatureComplete) {
+      final confirmedProfile = profile;
+      if (confirmedProfile != null) {
+        await nearbyTransport.sendSignatureState(
+          'released',
+          signerName: confirmedProfile.name,
+        );
+      }
+    }
+    holdController.reset();
   }
 
-  Future<void> acceptRequest() async {
+  Future<void> completeLocalSignature() async {
     if (requestState == 'signed') return;
+    if (localSignatureComplete || mutualAgreementSaved) return;
+    final confirmedProfile = profile;
+    if (confirmedProfile == null) return;
+    setState(() {
+      localSignatureComplete = true;
+      nearbyStatus = remoteSignatureComplete
+          ? 'Both signatures complete.'
+          : 'Your signature is complete. Waiting for the other phone.';
+    });
+    await nearbyTransport.sendSignatureState(
+      'complete',
+      signerName: confirmedProfile.name,
+    );
+    await maybeCompleteMutualAgreement();
+  }
+
+  Future<void> handleSignatureState(String state, String signerName) async {
+    if (!mounted || requestState == 'signed') return;
+    final peerName = cleanLocalPartyName(signerName, 'Nearby user');
+    setState(() {
+      incomingRequesterName = peerName;
+      if (state == 'holding') {
+        remoteHoldingSignature = true;
+        if (!remoteSignatureComplete) {
+          nearbyStatus = '$peerName is holding to sign.';
+        }
+      } else if (state == 'released') {
+        remoteHoldingSignature = false;
+        if (!remoteSignatureComplete) {
+          nearbyStatus = '$peerName released. Waiting for both signatures.';
+        }
+      } else if (state == 'complete') {
+        remoteHoldingSignature = false;
+        remoteSignatureComplete = true;
+        nearbyStatus = localSignatureComplete
+            ? 'Both signatures complete.'
+            : '$peerName signed. Hold for 5 seconds to finish.';
+      } else if (state == 'signed') {
+        remoteHoldingSignature = false;
+        remoteSignatureComplete = true;
+        nearbyStatus = localSignatureComplete
+            ? 'Consent signed on both phones.'
+            : '$peerName signed. Hold for 5 seconds to finish.';
+      }
+    });
+    await maybeCompleteMutualAgreement();
+  }
+
+  Future<void> maybeCompleteMutualAgreement() async {
+    if (mutualAgreementSaved ||
+        !localSignatureComplete ||
+        !remoteSignatureComplete) {
+      return;
+    }
     final confirmedProfile = profile;
     final requesterName = incomingRequesterName;
     if (confirmedProfile == null || requesterName == null) return;
+    mutualAgreementSaved = true;
     await sl<LocalConsentStore>().saveDecision(
       requesterName: requesterName,
       holderName: confirmedProfile.name,
       accepted: true,
     );
-    await nearbyTransport.sendDecision(true);
+    await nearbyTransport.sendSignatureState(
+      'signed',
+      signerName: confirmedProfile.name,
+    );
     if (!mounted) return;
     setState(() {
       requestState = 'signed';
+      nearbyStatus = 'Consent signed on both phones.';
       historyFuture = sl<LocalConsentStore>().records();
     });
-    toast('Agreement signed locally.');
+    toast('Consent signed on both phones.');
   }
 
   Future<void> cancelRequest() async {
@@ -1289,11 +1534,29 @@ class _LocalTouchConsentScreenState extends State<LocalTouchConsentScreen>
   Future<void> sendConsentRequest() async {
     final confirmedProfile = profile;
     if (confirmedProfile == null) return;
-    await nearbyTransport.sendConsentRequest(confirmedProfile);
+    String? agreementId;
+    // If logged in, create a backend agreement first then send its ID
+    if (_isLoggedIn) {
+      try {
+        final agreement = await sl<ConsentRepository>().createAgreement(
+          participantPhone: '', // will be filled by participant signing
+          title: 'Nearby Consent Agreement',
+          terms:
+              'Both parties mutually consent to this agreement via Green Light Nearby.',
+          durationHours: 24,
+        );
+        agreementId = agreement.id.toString();
+      } catch (_) {
+        // proceed with local-only if backend fails or no participant phone
+      }
+    }
+    await nearbyTransport.sendConsentRequest(
+      confirmedProfile,
+      agreementId: agreementId,
+    );
   }
 
   Future<void> enableNearbyPermissions() async {
-    final confirmedProfile = profile;
     setState(() {
       nearbyStatus = 'Opening nearby permission request...';
       nearbyPermissionRequired = false;
@@ -1301,14 +1564,7 @@ class _LocalTouchConsentScreenState extends State<LocalTouchConsentScreen>
       nearbyScanning = false;
     });
     await nearbyTransport.requestPermissionsOnOpen();
-    final missing = await refreshMissingPermissions();
-    if (!mounted) return;
-    if (confirmedProfile != null && missing.isEmpty) {
-      setState(() {
-        nearbyStatus = 'Ready to search nearby devices.';
-        nearbySetupIssue = false;
-      });
-    }
+    await prepareNearbyPage();
   }
 
   Future<void> retryNearbyScan() async {
@@ -1321,37 +1577,65 @@ class _LocalTouchConsentScreenState extends State<LocalTouchConsentScreen>
       });
       return;
     }
-    final missing = await refreshMissingPermissions();
-    if (missing.isNotEmpty) return;
+    final missing = await refreshNearbyReadiness();
+    if (missing.permissions.isNotEmpty || missing.settings.isNotEmpty) return;
     setState(() {
       nearbyStatus = 'Searching nearby devices...';
       nearbyPermissionRequired = false;
       nearbySetupIssue = false;
       nearbyScanning = true;
+      nearbyDevices.clear();
+      connectedNearbyDevices.clear();
     });
     await nearbyTransport.start(confirmedProfile, requestPermissions: false);
-    await refreshMissingPermissions();
+    await refreshNearbyReadiness();
   }
 
-  Future<List<NearbyPermissionRequirement>> refreshMissingPermissions() async {
-    final missing = await nearbyTransport.missingPermissionRequirements();
-    if (!mounted) return missing;
+  Future<
+    ({
+      List<NearbyPermissionRequirement> permissions,
+      List<NearbyPhoneSettingRequirement> settings,
+    })
+  >
+  refreshNearbyReadiness() async {
+    final permissions = await nearbyTransport.missingPermissionRequirements();
+    final settings = permissions.isEmpty
+        ? await nearbyTransport.missingPhoneSettingRequirements()
+        : <NearbyPhoneSettingRequirement>[];
+    if (!mounted) return (permissions: permissions, settings: settings);
     setState(() {
-      missingNearbyPermissions = missing;
-      nearbyPermissionRequired = missing.isNotEmpty;
-      if (missing.isNotEmpty) {
+      missingNearbyPermissions = permissions;
+      missingNearbySettings = settings;
+      nearbyPermissionRequired = permissions.isNotEmpty;
+      if (permissions.isNotEmpty || settings.isNotEmpty) {
         nearbyScanning = false;
+        nearbySetupIssue = settings.isNotEmpty;
+        nearbyStatus = permissions.isNotEmpty
+            ? 'Allow the required permissions below to scan for nearby users.'
+            : 'Turn on the required phone settings below, then search again.';
+      } else if (nearbySetupIssue) {
         nearbySetupIssue = false;
-        nearbyStatus =
-            'Allow the required permissions below to scan for nearby users.';
+        nearbyPermissionRequired = false;
+        nearbyStatus = 'Ready to search nearby devices.';
       }
     });
-    return missing;
+    return (permissions: permissions, settings: settings);
   }
 
   Future<void> prepareNearbyPage() async {
-    final missing = await refreshMissingPermissions();
-    if (!mounted || missing.isNotEmpty) return;
+    final missing = await refreshNearbyReadiness();
+    if (!mounted ||
+        missing.permissions.isNotEmpty ||
+        missing.settings.isNotEmpty) {
+      return;
+    }
+    final confirmedProfile = profile;
+    if (confirmedProfile == null) {
+      setState(() {
+        nearbyStatus = 'Confirm identity to start scanning.';
+      });
+      return;
+    }
     setState(() {
       nearbyStatus = 'Ready to search nearby devices.';
       nearbyPermissionRequired = false;
@@ -1364,16 +1648,14 @@ class _LocalTouchConsentScreenState extends State<LocalTouchConsentScreen>
     NearbyPermissionRequirement requirement,
   ) async {
     await nearbyTransport.requestPermission(requirement);
-    final missing = await refreshMissingPermissions();
-    if (!mounted) return;
-    if (profile != null && missing.isEmpty) {
-      setState(() {
-        nearbyStatus = 'Ready to search nearby devices.';
-        nearbyPermissionRequired = false;
-        nearbySetupIssue = false;
-        nearbyScanning = false;
-      });
-    }
+    await prepareNearbyPage();
+  }
+
+  Future<void> openNearbySetting(
+    NearbyPhoneSettingRequirement requirement,
+  ) async {
+    await requirement.openSettings();
+    await refreshNearbyReadiness();
   }
 
   @override
@@ -1433,7 +1715,12 @@ class _LocalTouchConsentScreenState extends State<LocalTouchConsentScreen>
                     ],
                   ),
                   const SizedBox(height: 24),
-                  _ConfirmedProfileHeader(profile: confirmedProfile),
+                  _NearbyUsersBeacon(
+                    pulse: pulseController,
+                    scanning: nearbyScanning,
+                    devices: nearbyDevices.values.toList(),
+                    connectedCount: connectedNearbyDevices.length,
+                  ),
                   const SizedBox(height: 34),
                   if (requestState == 'idle') ...[
                     _WaitingNearbyPanel(
@@ -1441,12 +1728,14 @@ class _LocalTouchConsentScreenState extends State<LocalTouchConsentScreen>
                       permissionRequired: nearbyPermissionRequired,
                       setupIssue: nearbySetupIssue,
                       missingPermissions: missingNearbyPermissions,
+                      missingSettings: missingNearbySettings,
                       scanning: nearbyScanning,
+                      profile: confirmedProfile,
                       onEnablePermissions: enableNearbyPermissions,
                       onRequestPermission: requestNearbyPermission,
+                      onOpenSetting: openNearbySetting,
                       onSearch: retryNearbyScan,
                       onOpenAppSettings: nearbyTransport.openAppPermissions,
-                      onSendRequest: sendConsentRequest,
                     ),
                   ] else ...[
                     _IncomingRequestPill(
@@ -1463,6 +1752,13 @@ class _LocalTouchConsentScreenState extends State<LocalTouchConsentScreen>
                       isCancelled: isCancelled,
                       onPointerDown: startHold,
                       onPointerUp: stopHold,
+                    ),
+                    const SizedBox(height: 18),
+                    _MutualSignatureStatus(
+                      localComplete: localSignatureComplete,
+                      remoteComplete: remoteSignatureComplete,
+                      remoteHolding: remoteHoldingSignature,
+                      peerName: incomingRequesterName ?? 'Nearby user',
                     ),
                     const SizedBox(height: 26),
                     _LocalPartiesPanel(
@@ -1508,12 +1804,12 @@ class _IncomingRequestPill extends StatelessWidget {
         ? 'User 1'
         : requester.trim();
     final title = state == 'incoming'
-        ? 'Incoming consent request'
+        ? 'Connected consent session'
         : state == 'signed'
         ? 'Agreement signed'
         : 'Request cancelled';
     final subtitle = state == 'incoming'
-        ? 'From $requesterName'
+        ? 'With $requesterName'
         : state == 'signed'
         ? 'Stored locally on this phone'
         : 'No agreement was created';
@@ -1685,46 +1981,118 @@ class _LocalIdentityConfirmationScreen extends StatelessWidget {
   }
 }
 
-class _ConfirmedProfileHeader extends StatelessWidget {
-  const _ConfirmedProfileHeader({required this.profile});
+class _NearbyUsersBeacon extends StatelessWidget {
+  const _NearbyUsersBeacon({
+    required this.pulse,
+    required this.scanning,
+    required this.devices,
+    required this.connectedCount,
+  });
 
-  final LocalUserProfile profile;
+  final Animation<double> pulse;
+  final bool scanning;
+  final List<String> devices;
+  final int connectedCount;
 
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: scheme.surfaceContainerHighest.withValues(alpha: 0.55),
-        borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: scheme.outlineVariant),
-      ),
-      child: Row(
-        children: [
-          Icon(Icons.verified_rounded, color: scheme.primary),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  profile.name,
-                  style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                    fontWeight: FontWeight.w800,
-                  ),
-                ),
-                Text(
-                  'Confirmed ID ${profile.maskedId}',
-                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                    color: scheme.onSurfaceVariant,
-                  ),
-                ),
-              ],
+    final hasDevices = devices.isNotEmpty;
+    final connected = connectedCount > 0;
+    final visibleDevices = devices
+        .map((name) => cleanLocalPartyName(name, 'Nearby user'))
+        .toSet()
+        .take(3)
+        .toList();
+    return AnimatedBuilder(
+      animation: pulse,
+      builder: (context, _) {
+        final glow = (scanning || hasDevices)
+            ? 0.16 + (pulse.value * 0.22)
+            : 0.08;
+        return Container(
+          padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 18),
+          decoration: BoxDecoration(
+            color: scheme.surfaceContainerHighest.withValues(alpha: 0.45),
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(
+              color: scheme.primary.withValues(alpha: connected ? 0.55 : 0.24),
             ),
+            boxShadow: [
+              BoxShadow(
+                color: scheme.primary.withValues(alpha: glow),
+                blurRadius: scanning ? 26 : 12,
+                spreadRadius: scanning ? 2 : 0,
+              ),
+            ],
           ),
-        ],
-      ),
+          child: Row(
+            children: [
+              Stack(
+                alignment: Alignment.center,
+                children: [
+                  Container(
+                    width: 54 + (scanning ? pulse.value * 8 : 0),
+                    height: 54 + (scanning ? pulse.value * 8 : 0),
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      border: Border.all(
+                        color: scheme.primary.withValues(alpha: glow),
+                        width: 2,
+                      ),
+                    ),
+                  ),
+                  CircleAvatar(
+                    radius: 22,
+                    backgroundColor: connected
+                        ? scheme.primary
+                        : scheme.primaryContainer,
+                    child: Icon(
+                      connected
+                          ? Icons.person_pin_circle_rounded
+                          : Icons.sensors_rounded,
+                      color: connected ? scheme.onPrimary : scheme.primary,
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(width: 14),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      connected
+                          ? 'Nearby user connected'
+                          : hasDevices
+                          ? 'Nearby user found'
+                          : scanning
+                          ? 'Looking for nearby users'
+                          : 'Nearby users',
+                      style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      connected
+                          ? 'Ready to send a consent request.'
+                          : hasDevices
+                          ? visibleDevices.join(', ')
+                          : scanning
+                          ? 'Keep both phones open and close together.'
+                          : 'Tap search when both phones are ready.',
+                      style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                        color: scheme.onSurfaceVariant,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        );
+      },
     );
   }
 }
@@ -1735,31 +2103,38 @@ class _WaitingNearbyPanel extends StatelessWidget {
     required this.permissionRequired,
     required this.setupIssue,
     required this.missingPermissions,
+    required this.missingSettings,
     required this.scanning,
+    required this.profile,
     required this.onEnablePermissions,
     required this.onRequestPermission,
+    required this.onOpenSetting,
     required this.onSearch,
     required this.onOpenAppSettings,
-    required this.onSendRequest,
   });
 
   final String status;
   final bool permissionRequired;
   final bool setupIssue;
   final List<NearbyPermissionRequirement> missingPermissions;
+  final List<NearbyPhoneSettingRequirement> missingSettings;
   final bool scanning;
+  final LocalUserProfile profile;
   final VoidCallback onEnablePermissions;
   final ValueChanged<NearbyPermissionRequirement> onRequestPermission;
+  final ValueChanged<NearbyPhoneSettingRequirement> onOpenSetting;
   final VoidCallback onSearch;
   final VoidCallback onOpenAppSettings;
-  final VoidCallback onSendRequest;
 
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
-    final hasIssue = permissionRequired || setupIssue;
+    final settingsRequired = missingSettings.isNotEmpty;
+    final hasIssue = permissionRequired || settingsRequired || setupIssue;
     final title = permissionRequired
         ? 'Nearby permissions needed'
+        : settingsRequired
+        ? 'Phone settings needed'
         : setupIssue
         ? 'Phone setup needed'
         : scanning
@@ -1767,8 +2142,10 @@ class _WaitingNearbyPanel extends StatelessWidget {
         : 'Ready to search';
     final description = permissionRequired
         ? 'Allow the exact permissions below before scanning.'
+        : settingsRequired
+        ? 'Open only the required setting below, then return to Green Light.'
         : setupIssue
-        ? 'Turn on the required phone settings, then tap search again.'
+        ? 'Tap search again. If Android blocks nearby, required actions will appear here.'
         : scanning
         ? 'Keep both phones unlocked with Green Light open.'
         : 'Tap the green button when the nearby phone is open.';
@@ -1828,6 +2205,14 @@ class _WaitingNearbyPanel extends StatelessWidget {
               icon: const Icon(Icons.settings_rounded),
               label: const Text('Open app permissions'),
             ),
+          ] else if (settingsRequired) ...[
+            for (final requirement in missingSettings) ...[
+              _PhoneSettingActionTile(
+                requirement: requirement,
+                onPressed: () => onOpenSetting(requirement),
+              ),
+              const SizedBox(height: 10),
+            ],
           ] else if (scanning) ...[
             Container(
               padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
@@ -1851,14 +2236,8 @@ class _WaitingNearbyPanel extends StatelessWidget {
                 ],
               ),
             ),
-            const SizedBox(height: 12),
-            FilledButton.icon(
-              onPressed: onSendRequest,
-              icon: const Icon(Icons.send_rounded),
-              label: const Text('Start request with nearby user'),
-            ),
           ] else ...[
-            _RoundNearbySearchButton(onPressed: onSearch),
+            _RoundNearbySearchButton(profile: profile, onPressed: onSearch),
           ],
         ],
       ),
@@ -1867,8 +2246,12 @@ class _WaitingNearbyPanel extends StatelessWidget {
 }
 
 class _RoundNearbySearchButton extends StatelessWidget {
-  const _RoundNearbySearchButton({required this.onPressed});
+  const _RoundNearbySearchButton({
+    required this.profile,
+    required this.onPressed,
+  });
 
+  final LocalUserProfile profile;
   final VoidCallback onPressed;
 
   @override
@@ -1905,7 +2288,93 @@ class _RoundNearbySearchButton extends StatelessWidget {
             context,
           ).textTheme.labelLarge?.copyWith(fontWeight: FontWeight.w800),
         ),
+        const SizedBox(height: 8),
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+          decoration: BoxDecoration(
+            color: scheme.surfaceContainerHighest.withValues(alpha: 0.55),
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(color: scheme.outlineVariant),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(Icons.verified_rounded, size: 18, color: scheme.primary),
+              const SizedBox(width: 8),
+              Flexible(
+                child: Text(
+                  '${profile.name} · ID ${profile.maskedId}',
+                  overflow: TextOverflow.ellipsis,
+                  style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                    color: scheme.onSurfaceVariant,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
       ],
+    );
+  }
+}
+
+class _PhoneSettingActionTile extends StatelessWidget {
+  const _PhoneSettingActionTile({
+    required this.requirement,
+    required this.onPressed,
+  });
+
+  final NearbyPhoneSettingRequirement requirement;
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: scheme.tertiaryContainer.withValues(alpha: 0.38),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: scheme.tertiary.withValues(alpha: 0.3)),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(requirement.icon, color: scheme.tertiary),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  requirement.label,
+                  style: Theme.of(
+                    context,
+                  ).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w800),
+                ),
+                const SizedBox(height: 3),
+                Text(
+                  requirement.description,
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: scheme.onSurfaceVariant,
+                    height: 1.3,
+                  ),
+                ),
+                const SizedBox(height: 10),
+                Align(
+                  alignment: Alignment.centerLeft,
+                  child: OutlinedButton.icon(
+                    onPressed: onPressed,
+                    icon: const Icon(Icons.open_in_new_rounded),
+                    label: Text(requirement.label),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
     );
   }
 }
@@ -1982,6 +2451,124 @@ class _PermissionActionTile extends StatelessWidget {
     if (id == 'location') return Icons.location_on_rounded;
     if (id == 'nearby_wifi') return Icons.wifi_rounded;
     return Icons.lock_open_rounded;
+  }
+}
+
+class _MutualSignatureStatus extends StatelessWidget {
+  const _MutualSignatureStatus({
+    required this.localComplete,
+    required this.remoteComplete,
+    required this.remoteHolding,
+    required this.peerName,
+  });
+
+  final bool localComplete;
+  final bool remoteComplete;
+  final bool remoteHolding;
+  final String peerName;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return SectionCard(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            'Signature status',
+            style: Theme.of(
+              context,
+            ).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w900),
+          ),
+          const SizedBox(height: 12),
+          _SignatureStatusRow(
+            label: 'You',
+            status: localComplete ? 'Signed' : 'Hold for 5 seconds',
+            done: localComplete,
+            active: !localComplete,
+          ),
+          const SizedBox(height: 10),
+          _SignatureStatusRow(
+            label: cleanLocalPartyName(peerName, 'Nearby user'),
+            status: remoteComplete
+                ? 'Signed'
+                : remoteHolding
+                ? 'Holding now'
+                : 'Waiting',
+            done: remoteComplete,
+            active: remoteHolding,
+          ),
+          const SizedBox(height: 10),
+          Text(
+            'The agreement is stored only after both phones complete the hold.',
+            style: Theme.of(context).textTheme.bodySmall?.copyWith(
+              color: scheme.onSurfaceVariant,
+              height: 1.3,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _SignatureStatusRow extends StatelessWidget {
+  const _SignatureStatusRow({
+    required this.label,
+    required this.status,
+    required this.done,
+    required this.active,
+  });
+
+  final String label;
+  final String status;
+  final bool done;
+  final bool active;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final color = done
+        ? scheme.primary
+        : active
+        ? scheme.tertiary
+        : scheme.onSurfaceVariant;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.1),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: color.withValues(alpha: 0.28)),
+      ),
+      child: Row(
+        children: [
+          Icon(
+            done
+                ? Icons.verified_rounded
+                : active
+                ? Icons.touch_app_rounded
+                : Icons.hourglass_empty_rounded,
+            color: color,
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              label,
+              style: Theme.of(
+                context,
+              ).textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.w800),
+            ),
+          ),
+          Text(
+            status,
+            style: Theme.of(context).textTheme.labelLarge?.copyWith(
+              color: color,
+              fontWeight: FontWeight.w900,
+            ),
+          ),
+        ],
+      ),
+    );
   }
 }
 
@@ -2100,7 +2687,7 @@ class _TouchConsentPad extends StatelessWidget {
               right: 24,
               child: Text(
                 enabled
-                    ? 'Press and hold to accept · Swipe left to cancel'
+                    ? 'Both phones hold for 5 seconds to sign'
                     : isSigned
                     ? 'Agreement is signed and stored on this phone'
                     : 'Request cancelled on this phone',
@@ -2157,13 +2744,13 @@ class _LocalPartiesPanel extends StatelessWidget {
         children: [
           _ReadOnlyPartyRow(
             icon: Icons.person_add_alt_1_rounded,
-            label: 'Request from',
+            label: 'Other signer',
             value: requesterName,
           ),
           const SizedBox(height: 12),
           _ReadOnlyPartyRow(
             icon: Icons.badge_rounded,
-            label: 'Your name',
+            label: 'You',
             value: holderName,
           ),
         ],
@@ -2320,7 +2907,7 @@ class _LoginScreenState extends State<LoginScreen> {
     setState(() => loading = true);
     try {
       await sl<AuthRepository>().login(phone.text.trim(), password.text);
-      if (mounted) context.go('/agreements');
+      if (mounted) context.go('/');
     } catch (error) {
       toast(error.toString());
     } finally {
